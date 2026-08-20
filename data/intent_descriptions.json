@@ -1,0 +1,52 @@
+[
+  {
+    "name": "open_app",
+    "description": "打开应用程序或软件",
+    "slots": {"app_name": "应用名称"}
+  },
+  {
+    "name": "close_app",
+    "description": "关闭应用程序或退出软件",
+    "slots": {"app_name": "应用名称"}
+  },
+  {
+    "name": "set_volume",
+    "description": "设置系统音量大小",
+    "slots": {"value": "音量百分比数值"}
+  },
+  {
+    "name": "set_timer",
+    "description": "设置定时提醒或闹钟",
+    "slots": {"minutes": "分钟数"}
+  },
+  {
+    "name": "list_apps",
+    "description": "列出所有已注册可打开的应用程序",
+    "slots": {}
+  },
+  {
+    "name": "check_app",
+    "description": "检查某个应用是否已安装",
+    "slots": {"app_name": "应用名称"}
+  },
+  {
+    "name": "save_to_folder",
+    "description": "将文本内容保存到指定文件夹或文件",
+    "slots": {"folder": "文件夹路径", "filepath": "文件路径", "content": "要保存的内容"}
+  },
+  {
+    "name": "douyin_control",
+    "description": "控制抖音播放，如播放、暂停、点赞、评论、滚动、关注、分享等操作",
+    "slots": {"action": "抖音操作指令"}
+  },
+  {
+    "name": "open_system_panel",
+    "description": "打开Windows系统面板或工具，包括设置、控制面板、任务管理器、网络设置、蓝牙、声音、显示、电源、个性化、应用管理、任务栏、投影、截图工具等",
+    "slots": {"panel": "系统面板名称"}
+  },
+  {
+    "name": "clear_memory",
+    "description": "清空本地 AI 的长期记忆（对话历史）",
+    "slots": {}
+  }
+]

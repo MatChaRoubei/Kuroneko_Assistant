@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+
+# Claude
+.claude/
+
+# Logs
+*.log
+assistant.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp
+tmp_check_apps.py
+test_output/
+
+# Models (downloaded separately)
+models/
+
+# Runtime generated (user data / local settings)
+chat_memory.json
+settings.json
+model_selection.json
+temp/
+console.log

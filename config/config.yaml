@@ -1,0 +1,27 @@
+wake_words:
+  - 你好黑猫
+  - 助手
+  - 黑猫
+  - 你好助手
+language: zh-CN
+speech_engine: sherpaonnx  # google (需要网络) / sherpaonnx (本地离线，推荐)
+speech_model_path: models/sense_voice  # sherpa-onnx 模型路径（相对于项目根目录）
+tts_engine: vits  # auto(自动回退) / edge(在线神经语音) / vits(本地神经语音，离线更快) / pyttsx3(机械音)
+tts_voice: zh-CN-XiaoxiaoNeural  # edge-tts 语音角色：晓晓(女)/云希(男 YunxiNeural)/云扬(男 YunyangNeural)
+intents_path: data/intents.json
+intent_descriptions_path: data/intent_descriptions.json
+plugin_path: plugins
+log_file: assistant.log
+app_map_path: config/app_map.json
+nlu_engine: fuzzy_regex
+enable_asr_correction: true
+enable_douyin_control: true
+# 唤醒词检测配置
+enable_wake_word_detector: false  # 停用 VAD，回退到文本模式
+wake_word_engine: text_fallback  # sherpaonnx_vad / porcupine / text_fallback
+wake_word_sensitivity: 0.5  # 检测灵敏度 (0.0-1.0)
+energy_threshold: 0.02  # 语音检测能量阈值（0.005~0.05）：环境噪音大导致误触发时调高；说话检测不到时调低
+# 危险操作确认（关机/重启/休眠），默认开启
+confirm_dangerous_actions: true
+# Ollama 大模型（AI 对话用），留空则自动检测 Ollama 已部署的模型
+ollama_model: ''
