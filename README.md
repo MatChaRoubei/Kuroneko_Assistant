@@ -114,6 +114,16 @@ pip install pypinyin rapidfuzz pyautogui jieba pycaw
 
 ### 下载语音模型（本地识别必需）
 
+**一键下载（推荐）**：
+
+```powershell
+python setup_models.py
+```
+
+自动下载并放置 SenseVoice（语音识别）和 VITS Melo TTS（语音合成）两个模型，已存在会自动跳过。
+
+**手动下载**：
+
 如需本地离线语音识别，需下载 sherpa-onnx 官方的 SenseVoice 模型：
 
 1. 下载地址：https://github.com/k2-fsa/sherpa-onnx/releases
