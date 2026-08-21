@@ -192,6 +192,29 @@ class SounddeviceMicrophone:
             return False, f'录音失败: {e}'
 
 
+    def iter_blocks(self, block_seconds=0.3):
+        """持续从麦克风读取固定时长的音频块（生成器），用于流式检测/端点判定。
+
+        每次 yield 一个一维 float32 numpy 数组（单声道）。相比 ``listen`` 的整段
+        固定时长录音，流式读取能把唤醒/端点检测的时延从「整段时长」降到「单块时长」，
+        并避免在静音时长时间空转录音。
+        """
+        rate = int(self.sample_rate)
+        block = max(int(rate * block_seconds), 256)
+        try:
+            with sd.InputStream(samplerate=rate, channels=1, dtype='float32',
+                                device=self.device, blocksize=block) as stream:
+                while True:
+                    data, _ = stream.read(block)
+                    yield data[:, 0]
+        except sd.PortAudioError as e:
+            print(f'[录音] 流式读取失败（PortAudio）: {e}')
+            return
+        except Exception as e:
+            print(f'[录音] 流式读取失败: {e}')
+            return
+
+
 def match_wake_word(text, wake_words, threshold=0.8):
     """在识别文本中查找唤醒词，返回 (是否命中, 唤醒词后的剩余文本)。
 
@@ -259,7 +282,49 @@ class SpeechRecognizer:
                 raise
         return False, f'识别失败: {last_error}'
 
+    def _recognize_wav(self, wav_bytes):
+        """识别 WAV 字节数据，返回 (success, text) —— 供唤醒后二次聆听复用"""
+        try:
+            audio_io = io.BytesIO(wav_bytes)
+            with sr.AudioFile(audio_io) as source:
+                audio = self.recognizer.record(source)
+            return self._recognize_with_retry(audio)
+        except sr.UnknownValueError:
+            return False, '无法识别语音内容'
+        except Exception as e:
+            return False, f'识别失败: {e}'
+
     def listen_once(self, timeout=5, phrase_time_limit=8):
+        """
+        录制并识别一段语音，返回 (success, text or error_message)。
+
+        改用 VAD 端点检测（listen_until_silence）代替固定时长录音：用户说完即停。
+        """
+        ok, audio_or_error = self.microphone.listen_until_silence(
+            max_duration=phrase_time_limit, silence_duration=1.0
+        )
+        if not ok:
+            return False, audio_or_error
+
+        audio_data = audio_or_error
+
+        try:
+            # 将 WAV 字节数据封装为 AudioFile（从内存）
+            audio_io = io.BytesIO(audio_data)
+            with sr.AudioFile(audio_io) as source:
+                audio = self.recognizer.record(source)
+
+            # 使用 Google 语音识别（需要网络），带重试
+            return self._recognize_with_retry(audio)
+
+        except sr.WaitTimeoutError:
+            return False, '监听超时，未检测到语音'
+        except sr.UnknownValueError:
+            return False, '无法识别语音内容'
+        except sr.RequestError as e:
+            return False, f'语音识别服务出错: {e}'
+        except Exception as e:
+            return False, f'识别失败: {e}'
         """
         录制并识别一段语音，返回 (success, text or error_message)
         """
@@ -310,29 +375,8 @@ class SpeechRecognizer:
             if not wake_words:
                 return True, normalized
 
-            found_wake = False
-            remaining = normalized
-            for wake in wake_words:
-                wake_lower = wake.lower()
-                if wake_lower in remaining:
-                    remaining = remaining.replace(wake_lower, '', 1).strip()
-                    found_wake = True
-                    print(f'[调试] 精确匹配唤醒词 [{wake}] 成功，剩余: [{remaining}]')
-                    break
-
-                from difflib import SequenceMatcher
-                wake_prefix = wake_lower[:max(2, len(wake_lower) - 2)]
-                for i in range(len(remaining) - len(wake_prefix) + 1):
-                    chunk = remaining[i:i + len(wake_prefix) + 2]
-                    ratio = SequenceMatcher(None, wake_prefix, chunk).ratio()
-                    if ratio >= 0.8:
-                        remaining = remaining[i + len(wake_prefix) + 2:].strip()
-                        found_wake = True
-                        print(f'[调试] 模糊匹配唤醒词 [{wake}] 成功（相似度 {ratio:.2f}），剩余: [{remaining}]')
-                        break
-                if found_wake:
-                    break
-
+            # 复用共享的 match_wake_word（精确 + 模糊），避免与模块函数重复实现
+            found_wake, remaining = match_wake_word(normalized, wake_words, threshold=0.8)
             if not found_wake:
                 print('未检测到唤醒词，继续监听...')
                 continue
@@ -371,17 +415,12 @@ class SpeechRecognizer:
         start_time = time.time()
 
         try:
-            while time.time() - start_time < timeout:
-                # 录制短音频片段（约 0.3 秒）
-                ok, audio_or_err = self.microphone.listen(
-                    timeout=5,
-                    phrase_time_limit=0.5
-                )
-                if not ok:
-                    continue
-
-                # VAD 检测是否包含语音
-                if wake_word_detector.detect_from_bytes(audio_or_err):
+            # 流式读取 0.3s 短块并实时做 VAD 检测，延迟从「整段录音」降到单块粒度，
+            # 不再每轮都固定录制 2.5 秒空转
+            for block in self.microphone.iter_blocks(0.3):
+                if time.time() - start_time >= timeout:
+                    return False, '唤醒词检测超时'
+                if wake_word_detector.detect_from_bytes(self._block_to_wav(block)):
                     wake_word_detector.stop()
                     return True, None
 
@@ -492,9 +531,26 @@ class SherpaONNXRecognizer:
         except Exception as e:
             return False, f'识别失败: {e}'
 
+    def _block_to_wav(self, block):
+        """把一段 float32 单声道音频块转成 16-bit PCM 的 WAV 字节（供 VAD 检测用）"""
+        audio_int16 = np.int16(np.clip(block, -1.0, 1.0) * 32767)
+        buf = io.BytesIO()
+        with wave.open(buf, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(int(self.sample_rate))
+            wf.writeframes(audio_int16.tobytes())
+        return buf.getvalue()
+
     def listen_once(self, timeout=5, phrase_time_limit=8):
-        """录制并识别一段语音，返回 (success, text or error_message)"""
-        ok, audio_or_error = self.microphone.listen(timeout=timeout, phrase_time_limit=phrase_time_limit)
+        """录制并识别一段语音，返回 (success, text or error_message)。
+
+        改用 VAD 端点检测（listen_until_silence）代替固定时长录音：用户说完即停，
+        不再固定等待整段时长，显著降低响应延迟、提升流畅度。
+        """
+        ok, audio_or_error = self.microphone.listen_until_silence(
+            max_duration=phrase_time_limit, silence_duration=1.0
+        )
         if not ok:
             return False, audio_or_error
         return self._recognize_wav(audio_or_error)
@@ -554,6 +610,11 @@ class SherpaONNXRecognizer:
                     if buffer.shape[0] < window_frames:
                         continue  # 窗口还没攒满，继续采集
 
+                    # 静音跳过：仅在检测到语音活动时做完整识别，避免无谓的高 CPU 解码
+                    rms = float(np.sqrt(np.mean(buffer.astype(np.float64) ** 2)))
+                    if rms < self.microphone.energy_threshold:
+                        continue
+
                     ok, text = self._recognize_wav(_to_wav(buffer))
                     if not ok:
                         _fail_count += 1
@@ -582,10 +643,12 @@ class SherpaONNXRecognizer:
                     if remaining:
                         return True, remaining
 
-                    # 只说唤醒词：进入聆听指令状态（固定时长录音识别指令）
+                    # 只说唤醒词：进入聆听指令状态（VAD 端点检测，说完即停）
                     print('[唤醒] 已唤醒，请说出指令...')
                     while True:
-                        ok2, wav2 = self.microphone.record_fixed(6.0)
+                        ok2, wav2 = self.microphone.listen_until_silence(
+                            max_duration=8.0, silence_duration=1.0
+                        )
                         if not ok2:
                             continue
                         ok2, text2 = self._recognize_wav(wav2)
@@ -632,9 +695,10 @@ class SherpaONNXRecognizer:
                 list(keywords), tokens, tokens_type='ppinyin'
             )
             with open(keywords_file, 'w', encoding='utf-8') as f:
-                for seq in token_seqs:
+                for kw, seq in zip(keywords, token_seqs):
                     if seq:
-                        f.write(' '.join(seq) + '\n')
+                        # 格式：拼音 token 序列 + @ 中文（get_result 返回 @ 后面的词）
+                        f.write(' '.join(seq) + ' @' + kw + '\n')
         except Exception as e:
             print(f'[KWS] 生成唤醒词文件失败: {e}')
             return None
@@ -643,7 +707,7 @@ class SherpaONNXRecognizer:
             threshold = 0.25
         else:
             try:
-                threshold = max(0.05, min(0.5, float(sensitivity) * 0.5))
+                threshold = max(0.05, min(0.35, float(sensitivity) * 0.35))
             except Exception:
                 threshold = 0.25
         try:
@@ -691,8 +755,9 @@ class SherpaONNXRecognizer:
                     while spotter.is_ready(kws_stream):
                         spotter.decode_stream(kws_stream)
                         keyword = spotter.get_result(kws_stream)
-                        spotter.reset_stream(kws_stream)
                         if keyword:
+                            # 检测到关键词才 reset，否则保留上下文继续累积
+                            spotter.reset_stream(kws_stream)
                             print(f'[KWS] 检测到唤醒词: {keyword}')
                             if on_wake:
                                 try:
@@ -706,9 +771,11 @@ class SherpaONNXRecognizer:
         return False, 'KWS 监听结束'
 
     def _listen_command_after_wake(self):
-        """唤醒后监听一条指令（固定时长录音 + SenseVoice 识别）"""
+        """唤醒后监听一条指令（VAD 端点检测，说完即停 + SenseVoice 识别）"""
         while True:
-            ok, wav = self.microphone.record_fixed(6.0)
+            ok, wav = self.microphone.listen_until_silence(
+                max_duration=8.0, silence_duration=1.0
+            )
             if not ok:
                 continue
             ok, text = self._recognize_wav(wav)
