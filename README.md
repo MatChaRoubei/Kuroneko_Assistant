@@ -6,7 +6,7 @@
 
 预编译的单文件版本（含全部模型依赖，开箱即用）：
 
-- **v0.0.3（当前版本）**：[VoiceAssistant.exe（约 455 MB）](https://github.com/MatChaRoubei/Kuroneko_Assistant/releases/download/v0.0.3/VoiceAssistant.exe)
+- **v0.0.3（当前版本）**：[VoiceAssistant.exe（约 455 MB，实际 477 MB）](https://github.com/MatChaRoubei/Kuroneko_Assistant/releases/download/v0.0.3/VoiceAssistant.exe)
   - 发布页（含变更说明）：<https://github.com/MatChaRoubei/Kuroneko_Assistant/releases/tag/v0.0.3>
   - 唤醒词稳健性修复 + 新增「停止词」，详见文末「v0.0.3」章节。
 - **v0.0.2 性能优化与重构版**：[VoiceAssistant.exe（约 455 MB）](https://github.com/MatChaRoubei/Kuroneko_Assistant/releases/download/v0.0.2/VoiceAssistant.exe)
