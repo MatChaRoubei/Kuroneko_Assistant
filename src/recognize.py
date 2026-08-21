@@ -405,7 +405,7 @@ class SherpaONNXRecognizer:
 
     _instance = None  # 类级别缓存，避免重复加载模型
 
-    def __init__(self, model_path='models/sense_voice', num_threads=4, energy_threshold=0.02):
+    def __init__(self, model_path='models/sense_voice', num_threads=2, energy_threshold=0.02):
         """
         初始化 sherpa-onnx 识别器
 
