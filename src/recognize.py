@@ -608,19 +608,35 @@ class SherpaONNXRecognizer:
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             'models', 'kws'
         )
-        encoder = glob.glob(os.path.join(model_dir, 'encoder-*.onnx'))
-        decoder = glob.glob(os.path.join(model_dir, 'decoder-*.onnx'))
-        joiner = glob.glob(os.path.join(model_dir, 'joiner-*.onnx'))
+        def _pick(prefix):
+            """优先 epoch-12 int8，其次任意 int8，再其次任意 onnx"""
+            for pat in (f'{prefix}-epoch-12-*.int8.onnx',
+                        f'{prefix}-*.int8.onnx',
+                        f'{prefix}-*.onnx'):
+                files = sorted(glob.glob(os.path.join(model_dir, pat)))
+                if files:
+                    return files[0]
+            return None
+
+        encoder = _pick('encoder')
+        decoder = _pick('decoder')
+        joiner = _pick('joiner')
         tokens = os.path.join(model_dir, 'tokens.txt')
         if not (encoder and decoder and joiner and os.path.exists(tokens)):
             return None
-        # 生成唤醒词文件（KeywordSpotter 需要 keywords_file，每行一个词）
+        # 生成唤醒词文件（KeywordSpotter 需要 keywords_file）
+        # 该模型 tokens 是拼音（ppinyin），需用 text2token 把中文词转成拼音 token 序列
         keywords_file = os.path.join(model_dir, 'keywords.txt')
         try:
+            token_seqs = sherpa_onnx.text2token(
+                list(keywords), tokens, tokens_type='ppinyin'
+            )
             with open(keywords_file, 'w', encoding='utf-8') as f:
-                for kw in keywords:
-                    f.write(kw + '\n')
-        except Exception:
+                for seq in token_seqs:
+                    if seq:
+                        f.write(' '.join(seq) + '\n')
+        except Exception as e:
+            print(f'[KWS] 生成唤醒词文件失败: {e}')
             return None
         # 灵敏度 -> 阈值映射（sensitivity 0.1~1.0，越低越宽松、越容易误触发）
         if sensitivity is None:
@@ -632,9 +648,9 @@ class SherpaONNXRecognizer:
                 threshold = 0.25
         try:
             return sherpa_onnx.KeywordSpotter(
-                encoder=encoder[0],
-                decoder=decoder[0],
-                joiner=joiner[0],
+                encoder=encoder,
+                decoder=decoder,
+                joiner=joiner,
                 tokens=tokens,
                 keywords_file=keywords_file,
                 num_threads=2,
@@ -665,16 +681,18 @@ class SherpaONNXRecognizer:
         rate = 16000
         block = int(rate * 0.1)  # 100ms
         try:
+            kws_stream = spotter.create_stream()
             with sd.InputStream(samplerate=rate, channels=1, dtype='int16',
                                 device=self.microphone.device, blocksize=block) as stream:
                 while True:
                     data, _ = stream.read(block)
                     samples = data[:, 0]
-                    spotter.accept_waveform(rate, samples)
-                    while spotter.is_ready():
-                        keyword = spotter.get_keyword()
-                        spotter.pop()
-                        if keyword is not None:
+                    kws_stream.accept_waveform(rate, samples)
+                    while spotter.is_ready(kws_stream):
+                        spotter.decode_stream(kws_stream)
+                        keyword = spotter.get_result(kws_stream)
+                        spotter.reset_stream(kws_stream)
+                        if keyword:
                             print(f'[KWS] 检测到唤醒词: {keyword}')
                             if on_wake:
                                 try:

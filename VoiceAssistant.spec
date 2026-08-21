@@ -60,6 +60,7 @@ a = Analysis(
         'pystray',
         'pystray._win32',
         'tkinter',
+        'sentencepiece',
         'aiohttp',
         'ddgs',
         'lxml',

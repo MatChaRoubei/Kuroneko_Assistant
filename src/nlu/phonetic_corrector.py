@@ -156,8 +156,9 @@ class PhoneticCorrector:
         text = re.sub(r'([零一二三四五六七八九〇])十([零一二三四五六七八九〇])',
                       lambda m: str(int(self._single_cn_to_digit(m.group(1))) * 10 + int(self._single_cn_to_digit(m.group(2)))), text)
 
-        # 8. 处理剩余的个位数字
-        text = re.sub(r'[零一二三四五六七八九〇]', self._single_cn_to_digit, text)
+        # 8. 处理剩余的个位数字，但"一"作为固定搭配（一下/一起/一些等）时保留"一"
+        text = re.sub(r'一(?!下|起|些|样|点|个|会儿|定|般|直|边|次|条|件|份|步|口气)', '1', text)
+        text = re.sub(r'[零二三四五六七八九〇]', self._single_cn_to_digit, text)
 
         return text
 
