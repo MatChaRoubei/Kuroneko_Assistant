@@ -6,6 +6,9 @@
 
 预编译的单文件版本（含全部模型依赖，开箱即用）：
 
+- **v0.0.3（当前版本）**：[VoiceAssistant.exe（约 455 MB）](https://github.com/MatChaRoubei/Kuroneko_Assistant/releases/download/v0.0.3/VoiceAssistant.exe)
+  - 发布页（含变更说明）：<https://github.com/MatChaRoubei/Kuroneko_Assistant/releases/tag/v0.0.3>
+  - 唤醒词稳健性修复 + 新增「停止词」，详见文末「v0.0.3」章节。
 - **v0.0.2 性能优化与重构版**：[VoiceAssistant.exe（约 455 MB）](https://github.com/MatChaRoubei/Kuroneko_Assistant/releases/download/v0.0.2/VoiceAssistant.exe)
   - 发布页（含变更说明）：<https://github.com/MatChaRoubei/Kuroneko_Assistant/releases/tag/v0.0.2>
   - 该版本已做语音识别/播报/执行链路的性能优化与代码重构，详见文末「性能优化与重构」章节。
@@ -330,7 +333,17 @@ pyinstaller VoiceAssistant.spec
 
 ## 开发历程
 
-### v0.0.1（当前版本）
+### v0.0.3（当前版本）
+- **唤醒词稳健性修复**：
+  - 识别匹配从「字符级模糊」升级为「拼音级匹配」，彻底解决同音字误判——「黑猫」与「黑毛」、「助手」与「朱手」拼音相同即等价，两字唤醒词（尤其「黑猫」）不再不稳定。
+  - KWS 模型原生词表不含自定义短唤醒词时自动回退到 STT + 拼音匹配（而非强行用 KWS 永远检测不到），对短词更稳。
+  - 两字及以下唤醒词放宽匹配阈值，避免「永远命中不了」。
+- **新增停止词（重新监听，不退出程序）**：
+  - 默认停止词：`停止`、`停下`、`闭嘴`、`别说了`、`打住`，可在 `config/config.yaml` 或 `settings.json` 的 `stop_words` 配置。
+  - AI 生成 / TTS 播报期间说出停止词即可中断当前回答并静音，回到监听状态；空闲时说出停止词直接重新监听。
+  - 文本模式按 `Esc` / `q` / `s` 键也可停止。
+
+### v0.0.1
 - 图形主窗口（展示识别与输出）+ 系统托盘图标
 - 可视化设置面板（唤醒词、灵敏度、语音引擎、声音角色、大模型）
 - 接入 Ollama 大模型对话，自动检测模型 + 手动选择

@@ -308,6 +308,11 @@ def _tts_worker_loop():
         if item is None:
             _tts_queue.task_done()
             break
+        # 已在请求停止（如用户说了停止词）：跳过本条待播报，快速静音
+        from src.stop import is_stop_requested
+        if is_stop_requested():
+            _tts_queue.task_done()
+            continue
         with _tts_lock:
             _speaking.set()
             try:
@@ -315,6 +320,20 @@ def _tts_worker_loop():
             finally:
                 _speaking.clear()
         _tts_queue.task_done()
+
+
+def clear_speaking():
+    """清空待播报队列（停止词触发时调用，让助手尽快静音）。
+    当前正在播报的一条会自然结束（edge/vits 的 mp3 播放已支持中途停止）。"""
+    try:
+        while not _tts_queue.empty():
+            try:
+                _tts_queue.get_nowait()
+                _tts_queue.task_done()
+            except Exception:
+                break
+    except Exception:
+        pass
 
 
 def _ensure_tts_worker():

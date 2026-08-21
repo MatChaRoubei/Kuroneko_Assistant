@@ -214,36 +214,128 @@ class SounddeviceMicrophone:
             return
 
 
+def _pinyin_alignment(text):
+    """返回 (连续拼音串, 各字符拼音起始位置列表[含哨兵])。
+
+    连续拼音串把每个字的拼音无缝拼接（如 "黑猫" -> "heimao"），用于做
+    同音字无关的匹配（"黑猫"/"黑毛" 拼音相同即等价）。
+    若 pypinyin 不可用或字符数对不齐（含无法转拼音的符号），返回 (None, None)。
+    """
+    try:
+        from pypinyin import lazy_pinyin, Style
+    except Exception:
+        return None, None
+    try:
+        pys = lazy_pinyin(text, style=Style.NORMAL)
+    except Exception:
+        return None, None
+    if len(pys) != len(text):
+        return None, None
+    parts = [str(p) for p in pys]
+    starts = []
+    pos = 0
+    for p in parts:
+        starts.append(pos)
+        pos += len(p)
+    starts.append(pos)  # 哨兵：总长度
+    return ''.join(parts), starts
+
+
+def _span_to_chars(starts, py_start, py_end):
+    """把拼音位置区间 [py_start, py_end) 映射回原始字符区间 [c_start, c_end)。"""
+    n = len(starts) - 1
+    c_start = 0
+    for i in range(n):
+        if starts[i] <= py_start < starts[i + 1]:
+            c_start = i
+            break
+    c_end = n
+    for i in range(n):
+        if starts[i] < py_end <= starts[i + 1]:
+            c_end = i + 1
+            break
+    return c_start, c_end
+
+
+def _match_one(text, word, threshold=0.8):
+    """在 text 中查找 word，返回 (是否命中, 命中后的剩余文本)。
+
+    匹配顺序：
+      1) 精确文本匹配（最高优先）
+      2) 拼音匹配：消解同音字 —— "黑猫"/"黑毛"、"助手"/"朱手" 拼音相同即等价，
+         这正是两字唤醒词（尤其"黑猫"）不稳定的根因所在
+      3) 字符级模糊兜底：处理缺字/部分识别错误；短词放宽阈值
+    """
+    from difflib import SequenceMatcher
+
+    if not text or not word:
+        return False, text
+
+    text_l = text.lower()
+    word_l = word.lower()
+
+    # 1) 精确文本匹配
+    if word_l in text_l:
+        remaining = text_l.replace(word_l, '', 1).strip()
+        return True, remaining
+
+    # 2) 拼音匹配（同音字完全等价）
+    text_py, starts = _pinyin_alignment(text_l)
+    if text_py is not None:
+        word_py, _ = _pinyin_alignment(word_l)
+        if word_py:
+            idx = text_py.find(word_py)
+            if idx != -1:
+                c_start, c_end = _span_to_chars(starts, idx, idx + len(word_py))
+                remaining = (text_l[:c_start] + ' ' + text_l[c_end:]).strip()
+                return True, remaining
+
+    # 3) 字符级模糊兜底（缺字/部分识别错误；两字词放宽阈值，避免永远命中不了）
+    eff_threshold = threshold
+    if len(word_l) <= 2:
+        eff_threshold = min(threshold, 0.6)
+    wake_prefix = word_l[:max(2, len(word_l) - 2)]
+    for i in range(len(text_l) - len(wake_prefix) + 1):
+        chunk = text_l[i:i + len(wake_prefix) + 2]
+        ratio = SequenceMatcher(None, word_l, chunk).ratio()
+        if ratio >= eff_threshold:
+            remaining = (text_l[:i] + ' ' + text_l[i + len(wake_prefix) + 2:]).strip()
+            return True, remaining
+
+    return False, text
+
+
 def match_wake_word(text, wake_words, threshold=0.8):
     """在识别文本中查找唤醒词，返回 (是否命中, 唤醒词后的剩余文本)。
 
     text: 已转小写并去除首尾空白的文本
     wake_words: 唤醒词列表
     """
-    from difflib import SequenceMatcher
-
     if not text or not wake_words:
         return False, text
 
     remaining = text
     for wake in wake_words:
-        wake_lower = wake.lower()
-        if wake_lower in remaining:
-            remaining = remaining.replace(wake_lower, '', 1).strip()
-            print(f'[唤醒] 精确匹配唤醒词 [{wake}]，剩余指令: [{remaining}]')
-            return True, remaining
-
-        # 模糊匹配：ASR 可能把唤醒词识别错
-        wake_prefix = wake_lower[:max(2, len(wake_lower) - 2)]
-        for i in range(len(remaining) - len(wake_prefix) + 1):
-            chunk = remaining[i:i + len(wake_prefix) + 2]
-            ratio = SequenceMatcher(None, wake_prefix, chunk).ratio()
-            if ratio >= threshold:
-                remaining = remaining[i + len(wake_prefix) + 2:].strip()
-                print(f'[唤醒] 模糊匹配唤醒词 [{wake}]（相似度 {ratio:.2f}），剩余指令: [{remaining}]')
-                return True, remaining
+        hit, rest = _match_one(remaining, wake, threshold)
+        if hit:
+            print(f'[唤醒] 命中唤醒词 [{wake}]，剩余指令: [{rest}]')
+            return True, rest
 
     return False, text
+
+
+def match_phrase(text, phrases, threshold=0.8):
+    """判断 text 是否包含任一 phrase（拼音级，用于停止词等）。
+
+    返回 (是否命中, 命中的词)。
+    """
+    if not text or not phrases:
+        return False, None
+    for phrase in phrases:
+        hit, _ = _match_one(text, phrase, threshold)
+        if hit:
+            return True, phrase
+    return False, None
 
 
 class SpeechRecognizer:
@@ -637,6 +729,44 @@ class SherpaONNXRecognizer:
             print(f'[监听] 录音错误: {e}')
             return False, str(e)
 
+    def _kws_native_covers(self, keywords, model_dir):
+        """判断 KWS 模型原生词表是否覆盖配置的唤醒词。
+
+        该 KWS 模型在固定原生关键词（models/kws/keywords_raw.txt）上训练，
+        只有这些词能被稳定检测。若配置的唤醒词（如自定义短词「黑猫」）不在
+        原生词表里，则不应启用 KWS，应回退到 STT + 拼音匹配（更灵活、对短词更稳）。
+
+        返回 True 表示可启用 KWS；返回 False 表示应回退到 STT。
+        """
+        import os
+        raw = os.path.join(model_dir, 'keywords_raw.txt')
+        if not os.path.exists(raw):
+            return True  # 无原生词表信息，保持原行为（尝试 KWS）
+        try:
+            with open(raw, 'r', encoding='utf-8') as f:
+                native = [line.strip() for line in f if line.strip()]
+        except Exception:
+            return True
+        if not native:
+            return True
+
+        native_pys = set()
+        for n in native:
+            np_, _ = _pinyin_alignment(n.lower())
+            if np_:
+                native_pys.add(np_)
+        if not native_pys:
+            return True
+
+        for kw in keywords:
+            kp, _ = _pinyin_alignment(kw.lower())
+            if not kp:
+                continue
+            for np_ in native_pys:
+                if kp in np_:
+                    return True
+        return False
+
     def _init_kws(self, keywords, sensitivity=None):
         """初始化 KeywordSpotter（低功耗唤醒词检测），模型不可用返回 None"""
         import os
@@ -664,6 +794,12 @@ class SherpaONNXRecognizer:
         joiner = _pick('joiner')
         tokens = os.path.join(model_dir, 'tokens.txt')
         if not (encoder and decoder and joiner and os.path.exists(tokens)):
+            return None
+        # 该 KWS 模型只在固定原生词表内有效（见 models/kws/keywords_raw.txt，
+        # 如「小爱同学/你好军哥」等）。自定义/短唤醒词（如「黑猫」「助手」）不在
+        # 原生词表中，强行用 KWS 永远检测不到，必须回退到 STT + 拼音匹配。
+        if not _kws_native_covers(keywords, model_dir):
+            print('[KWS] 配置唤醒词不在模型原生词表内，回退到 STT 拼音匹配（对短词更稳定）')
             return None
         # 生成唤醒词文件（KeywordSpotter 需要 keywords_file）
         # 该模型 tokens 是拼音（ppinyin），需用 text2token 把中文词转成拼音 token 序列

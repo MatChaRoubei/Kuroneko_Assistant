@@ -47,15 +47,15 @@ from src.cleaner import (
 from src.config import load_config
 from src.executor import execute_intent, configure_ollama
 from src.feedback import say, notify, configure_tts, warmup_tts, say_sync, wait_speaking_done, say_wake
-from src.stop import begin_output, end_output, start_stop_listener
+from src.stop import begin_output, end_output, start_stop_listener, request_stop, is_stop_requested
 from src.intents import IntentParser
 from src.logger import configure_logging, get_logger
 from src.plugins import PluginManager
-from src.recognize import SpeechRecognizer, SherpaONNXRecognizer, check_speech_dependencies
+from src.recognize import SpeechRecognizer, SherpaONNXRecognizer, check_speech_dependencies, match_phrase
 from src.nlu.phonetic_corrector import PhoneticCorrector
 from src.nlu.fuzzy_regex import FuzzyRegexMatcher
 from src.tray import start_tray
-from src.gui import load_selected_model, append_asr, append_output, set_status, start_main_window, load_settings, get_wake_words, get_tts_engine, get_tts_voice, get_sensitivity
+from src.gui import load_selected_model, append_asr, append_output, set_status, start_main_window, load_settings, get_wake_words, get_tts_engine, get_tts_voice, get_sensitivity, get_stop_words
 
 
 def create_recognizer(cfg):
@@ -286,6 +286,12 @@ def main():
                 say('再见')
                 break
 
+            # 停止词：重新监听（不退出程序，也不执行指令）
+            hit_stop, sw = match_phrase(query, get_stop_words())
+            if hit_stop:
+                logger.info(f'命中停止词 [{sw}]，重新监听')
+                continue
+
             # ASR 纠错
             if corrector:
                 corrected = corrector.correct(query)
@@ -324,9 +330,9 @@ def main():
                 continue
 
             if intent_name == 'unknown':
-                # AI 生成：启动停止监听（语音说“停”或按 Esc 键停止）
+                # AI 生成：启动停止监听（语音说出停止词或按 Esc 键停止）
                 begin_output()
-                start_stop_listener(use_voice, recognizer)
+                start_stop_listener(use_voice, recognizer, get_stop_words())
                 success, message = execute_intent(intent_name, slots, query)
                 end_output()
             else:

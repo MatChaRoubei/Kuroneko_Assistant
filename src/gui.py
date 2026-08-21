@@ -267,12 +267,13 @@ class MainWindow:
             self.text.see('end')
 
 
-# 运行时设置（唤醒词、灵敏度、TTS 引擎）
+# 运行时设置（唤醒词、停止词、灵敏度、TTS 引擎）
 _runtime = {
     'wake_words': ['你好黑猫', '助手', '黑猫', '你好助手'],
     'sensitivity': 0.8,
     'tts_engine': 'vits',
     'tts_voice': 'zh-CN-XiaoxiaoNeural',
+    'stop_words': ['停止', '停下', '闭嘴', '别说了', '打住'],
 }
 
 # edge-tts 声音角色（显示名 -> voice id）
@@ -311,6 +312,12 @@ def load_settings():
                 _runtime['tts_engine'] = data['tts_engine']
             if 'tts_voice' in data and data['tts_voice']:
                 _runtime['tts_voice'] = data['tts_voice']
+            if 'stop_words' in data:
+                sw = data['stop_words']
+                if isinstance(sw, str):
+                    sw = [w.strip() for w in sw.replace('，', ',').split(',') if w.strip()]
+                if isinstance(sw, list) and sw:
+                    _runtime['stop_words'] = sw
     except Exception:
         pass
 
@@ -337,6 +344,10 @@ def get_wake_words():
 
 def get_sensitivity():
     return _runtime.get('sensitivity', 0.8)
+
+
+def get_stop_words():
+    return _runtime.get('stop_words', ['停止', '停下', '闭嘴', '别说了', '打住'])
 
 
 def get_tts_engine():
