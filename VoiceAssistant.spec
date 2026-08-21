@@ -10,22 +10,29 @@ project_root = SPECPATH
 runtime_tmpdir = os.path.join(SPECPATH, 'dist', 'temp')
 os.makedirs(runtime_tmpdir, exist_ok=True)
 
+# 打包的数据文件
+datas = [
+    (os.path.join(project_root, 'icon.ico'), '.'),
+    (os.path.join(project_root, 'firstUI.png'), '.'),
+    (os.path.join(project_root, 'config'), 'config'),
+    (os.path.join(project_root, 'data'), 'data'),
+    (os.path.join(project_root, 'plugins'), 'plugins'),
+    # 只打包本地离线识别模型必需的文件，排除测试音频
+    (os.path.join(project_root, 'models', 'sense_voice', 'model.int8.onnx'), os.path.join('models', 'sense_voice')),
+    (os.path.join(project_root, 'models', 'sense_voice', 'tokens.txt'), os.path.join('models', 'sense_voice')),
+    # 本地神经语音（TTS）模型，离线回退用
+    (os.path.join(project_root, 'models', 'vits-melo-tts-zh_en'), os.path.join('models', 'vits-melo-tts-zh_en')),
+]
+# 唤醒词检测模型（KWS，可选，模型文件存在才打包）
+kws_dir = os.path.join(project_root, 'models', 'kws')
+if os.path.isdir(kws_dir) and os.path.exists(os.path.join(kws_dir, 'tokens.txt')):
+    datas.append((kws_dir, os.path.join('models', 'kws')))
+
 a = Analysis(
     [os.path.join(project_root, 'src', 'main.py')],
     pathex=[project_root],
     binaries=[],
-    datas=[
-        (os.path.join(project_root, 'icon.ico'), '.'),
-        (os.path.join(project_root, 'firstUI.png'), '.'),
-        (os.path.join(project_root, 'config'), 'config'),
-        (os.path.join(project_root, 'data'), 'data'),
-        (os.path.join(project_root, 'plugins'), 'plugins'),
-        # 只打包本地离线识别模型必需的文件，排除测试音频
-        (os.path.join(project_root, 'models', 'sense_voice', 'model.int8.onnx'), os.path.join('models', 'sense_voice')),
-        (os.path.join(project_root, 'models', 'sense_voice', 'tokens.txt'), os.path.join('models', 'sense_voice')),
-        # 本地神经语音（TTS）模型，离线回退用
-        (os.path.join(project_root, 'models', 'vits-melo-tts-zh_en'), os.path.join('models', 'vits-melo-tts-zh_en')),
-    ],
+    datas=datas,
     hiddenimports=[
         'numpy',
         'sounddevice',

@@ -244,7 +244,7 @@ def main():
                         continue
                 else:
                     # 持续监听：听到唤醒词才反应（唤醒瞬间播报"我在"）
-                    ok, query = recognizer.listen_with_wake_word(
+                    ok, query = recognizer.listen_with_kws(
                         get_wake_words(),
                         on_wake=lambda: (say_sync('我在'), set_status('● 已唤醒，请说指令')),
                         sensitivity=get_sensitivity(),

@@ -27,6 +27,11 @@ TTS_URL = (
     'https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/'
     'vits-melo-tts-zh_en.tar.bz2'
 )
+# 唤醒词检测模型（KeywordSpotter，低功耗，仅约 31MB）
+KWS_URL = (
+    'https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/'
+    'sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01.tar.bz2'
+)
 
 
 def download(url, filename):
@@ -94,11 +99,32 @@ def setup_vits():
     print('[OK] VITS TTS 模型放置完成')
 
 
+def setup_kws():
+    """下载 KWS 唤醒词检测模型 -> models/kws/"""
+    dest = os.path.join(ROOT, 'models', 'kws')
+    if os.path.exists(os.path.join(dest, 'tokens.txt')):
+        print('[OK] KWS 唤醒词检测模型已就绪')
+        return
+
+    tar_path = download(KWS_URL, '_kws.tar.bz2')
+    os.makedirs(dest, exist_ok=True)
+    with tarfile.open(tar_path, 'r:bz2') as tf:
+        for m in tf.getmembers():
+            base = os.path.basename(m.name)
+            if m.isfile() and base.endswith(('.onnx', '.txt')):
+                with tf.extractfile(m) as src, \
+                        open(os.path.join(dest, base), 'wb') as dst:
+                    shutil.copyfileobj(src, dst)
+    os.remove(tar_path)
+    print('[OK] KWS 唤醒词检测模型放置完成')
+
+
 if __name__ == '__main__':
     print('=== 黑猫语音助手 - 语音模型下载 ===')
     try:
         setup_sense_voice()
         setup_vits()
+        setup_kws()
         print('=== 全部完成 ===')
         print('现在可以运行：python src/main.py（源码）或 dist\\VoiceAssistant.exe（打包版）')
     except KeyboardInterrupt:

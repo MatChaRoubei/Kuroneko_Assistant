@@ -596,6 +596,91 @@ class SherpaONNXRecognizer:
             print(f'[监听] 录音错误: {e}')
             return False, str(e)
 
+    def _init_kws(self, keywords):
+        """初始化 KeywordSpotter（低功耗唤醒词检测），模型不可用返回 None"""
+        import os
+        import glob
+        try:
+            import sherpa_onnx
+        except ImportError:
+            return None
+        model_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            'models', 'kws'
+        )
+        encoder = glob.glob(os.path.join(model_dir, 'encoder-*.onnx'))
+        decoder = glob.glob(os.path.join(model_dir, 'decoder-*.onnx'))
+        joiner = glob.glob(os.path.join(model_dir, 'joiner-*.onnx'))
+        tokens = os.path.join(model_dir, 'tokens.txt')
+        if not (encoder and decoder and joiner and os.path.exists(tokens)):
+            return None
+        try:
+            return sherpa_onnx.KeywordSpotter(
+                encoder=encoder[0],
+                decoder=decoder[0],
+                joiner=joiner[0],
+                tokens=tokens,
+                keywords=list(keywords),
+                num_threads=2,
+                sample_rate=16000,
+                feature_dim=80,
+                provider='cpu',
+            )
+        except Exception as e:
+            print(f'[KWS] 初始化失败: {e}')
+            return None
+
+    def listen_with_kws(self, keywords=None, on_wake=None, sensitivity=None):
+        """低功耗唤醒词检测（KeywordSpotter）。
+
+        模型可用时用 KWS 实时流式检测唤醒词（低功耗、低延迟），
+        检测到唤醒词后进入指令监听（SenseVoice 识别）。
+        模型不可用时自动回退到滑动窗口 STT 方案。
+        """
+        if keywords is None:
+            keywords = []
+        spotter = self._init_kws(keywords)
+        if spotter is None:
+            print('[KWS] 模型不可用，回退到滑动窗口识别')
+            return self.listen_with_wake_word(keywords, on_wake, sensitivity)
+
+        print('[KWS] 低功耗唤醒词检测已启动')
+        rate = 16000
+        block = int(rate * 0.1)  # 100ms
+        try:
+            with sd.InputStream(samplerate=rate, channels=1, dtype='int16',
+                                device=self.microphone.device, blocksize=block) as stream:
+                while True:
+                    data, _ = stream.read(block)
+                    samples = data[:, 0]
+                    spotter.accept_waveform(rate, samples)
+                    while spotter.is_ready():
+                        keyword = spotter.get_keyword()
+                        spotter.pop()
+                        if keyword is not None:
+                            print(f'[KWS] 检测到唤醒词: {keyword}')
+                            if on_wake:
+                                try:
+                                    on_wake()
+                                except Exception:
+                                    pass
+                            return self._listen_command_after_wake()
+        except Exception as e:
+            print(f'[KWS] 监听错误: {e}')
+            return False, str(e)
+        return False, 'KWS 监听结束'
+
+    def _listen_command_after_wake(self):
+        """唤醒后监听一条指令（固定时长录音 + SenseVoice 识别）"""
+        while True:
+            ok, wav = self.microphone.record_fixed(6.0)
+            if not ok:
+                continue
+            ok, text = self._recognize_wav(wav)
+            if not ok:
+                continue
+            return True, text.strip()
+
     def listen_await_wake_word(self, wake_word_detector=None, timeout=60):
         """
         使用专用唤醒词检测器（VAD）进行常驻监听
