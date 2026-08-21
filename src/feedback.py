@@ -27,18 +27,43 @@ def configure_tts(engine='auto', voice='zh-CN-XiaoxiaoNeural'):
         _edge_voice = voice
 
 
+_wake_audio = None  # 预生成的唤醒反馈音频 (samples, sample_rate)
+
+
 def warmup_tts():
-    """后台预热本地 TTS 引擎，减少首次语音响应的延迟"""
+    """后台预热本地 TTS 引擎，并预生成唤醒反馈音频，减少首次响应延迟"""
     def _warm():
+        global _wake_audio
         try:
             if _engine_pref in ('vits', 'auto'):
-                _init_vits()
+                tts = _init_vits()
+                if tts is not None:
+                    import numpy as np
+                    audio = tts.generate('我在', sid=0, speed=1.0)
+                    samples = np.asarray(audio.samples, dtype=np.float32)
+                    if samples.size:
+                        _wake_audio = (samples, audio.sample_rate)
+                        print('[TTS] 唤醒反馈音频已预生成')
         except Exception:
             pass
     try:
         threading.Thread(target=_warm, daemon=True, name='tts-warmup').start()
     except Exception:
         pass
+
+
+def say_wake():
+    """快速播报唤醒反馈「我在」：优先用预生成音频，跳过合成延迟"""
+    import sounddevice as sd
+    if _wake_audio is not None:
+        try:
+            samples, rate = _wake_audio
+            sd.play(samples, rate, blocksize=8192)
+            sd.wait()
+            return True
+        except Exception as e:
+            print(f'[TTS] 快速唤醒播报失败: {e}')
+    return say_sync('我在')
 
 
 def _get_tmp_dir():

@@ -46,7 +46,7 @@ from src.cleaner import (
 # 统一使用 src 包绝对导入，兼容源码运行与打包运行
 from src.config import load_config
 from src.executor import execute_intent, configure_ollama
-from src.feedback import say, notify, configure_tts, warmup_tts, say_sync, wait_speaking_done
+from src.feedback import say, notify, configure_tts, warmup_tts, say_sync, wait_speaking_done, say_wake
 from src.stop import begin_output, end_output, start_stop_listener
 from src.intents import IntentParser
 from src.logger import configure_logging, get_logger
@@ -246,7 +246,7 @@ def main():
                     # 持续监听：听到唤醒词才反应（唤醒瞬间播报"我在"）
                     ok, query = recognizer.listen_with_kws(
                         get_wake_words(),
-                        on_wake=lambda: (say_sync('我在'), set_status('● 已唤醒，请说指令')),
+                        on_wake=lambda: (say_wake(), set_status('● 已唤醒，请说指令')),
                         sensitivity=get_sensitivity(),
                     )
                     if not ok:
