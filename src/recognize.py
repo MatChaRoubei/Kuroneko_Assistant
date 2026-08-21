@@ -901,13 +901,15 @@ class SherpaONNXRecognizer:
         except Exception:
             pass
 
-        # 2) 静音预检：等到麦克风真正安静（回声/设备尾音消散）再收音，
-        #    避免把「我在」的尾音直接录入。最多等 3s，超时则直接尝试收音。
+        # 2) 静音预检：等到麦克风真正安静（唤醒词尾音 + 「我在」回声都消散）再收音。
+        #    关键是「你好助手」这类长唤醒词用户说完约需 1s，KWS 命中瞬间用户往往还在
+        #    说尾音；若立刻收音会把「你好」残段录成指令。需连续静音足够久才起步。
+        #    最多等 4s，超时（用户一直在连续说话）则直接尝试收音，避免卡死。
         try:
             threshold = self.microphone.energy_threshold
-            quiet_needed = 0.3          # 需连续静音的时长
+            quiet_needed = 0.7          # 需连续静音的时长（覆盖唤醒词尾音+回声）
             quiet_accum = 0.0
-            deadline = _t.time() + 3.0
+            deadline = _t.time() + 4.0
             for block in self.microphone.iter_blocks(0.1):
                 energy = float(np.sqrt(np.mean(block.astype(np.float64) ** 2)))
                 if energy <= threshold:
