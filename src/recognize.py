@@ -798,7 +798,7 @@ class SherpaONNXRecognizer:
         # 该 KWS 模型只在固定原生词表内有效（见 models/kws/keywords_raw.txt，
         # 如「小爱同学/你好军哥」等）。自定义/短唤醒词（如「黑猫」「助手」）不在
         # 原生词表中，强行用 KWS 永远检测不到，必须回退到 STT + 拼音匹配。
-        if not _kws_native_covers(keywords, model_dir):
+        if not self._kws_native_covers(keywords, model_dir):
             print('[KWS] 配置唤醒词不在模型原生词表内，回退到 STT 拼音匹配（对短词更稳定）')
             return None
         # 生成唤醒词文件（KeywordSpotter 需要 keywords_file）
