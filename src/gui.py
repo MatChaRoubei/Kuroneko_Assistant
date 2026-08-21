@@ -141,6 +141,8 @@ class MainWindow:
         self.root = None
         self.text = None
         self.status_label = None
+        self._win_w = 1000
+        self._win_h = 560
 
     def run(self):
         """阻塞运行窗口（在调用线程）"""
@@ -148,7 +150,7 @@ class MainWindow:
             import tkinter as tk
             from PIL import Image, ImageTk
 
-            W, H = 1000, 560
+            W, H = self._win_w, self._win_h
             self.root = tk.Tk()
             self.root.title('黑猫语音助手')
             self.root.geometry(f'{W}x{H}')
@@ -223,10 +225,15 @@ class MainWindow:
                 pass
 
     def show(self):
-        """显示窗口（从托盘唤起）"""
+        """显示窗口（从托盘唤起），并恢复正确的位置和大小"""
         if self.root:
             try:
                 self.root.deiconify()
+                # withdraw 后 geometry 可能丢失，重新设置并居中
+                w, h = self._win_w, self._win_h
+                x = (self.root.winfo_screenwidth() - w) // 2
+                y = (self.root.winfo_screenheight() - h) // 2
+                self.root.geometry(f'{w}x{h}+{x}+{y}')
                 self.root.lift()
                 self.root.focus_force()
             except Exception:
