@@ -835,6 +835,21 @@ def _stream_chat():
     return True, reply
 
 
+def web_search(query):
+    """打开默认浏览器搜索关键词（对应"搜索一下"等语音指令）"""
+    import urllib.parse
+    query = (query or '').strip()
+    if not query:
+        return False, '请告诉我要搜索的内容，例如「搜索一下 Python 教程」'
+    url = 'https://www.baidu.com/s?wd=' + urllib.parse.quote(query)
+    try:
+        import webbrowser
+        webbrowser.open(url)
+        return True, f'已在浏览器搜索：{query}'
+    except Exception as e:
+        return False, f'打开浏览器失败: {e}'
+
+
 def cleanup_space():
     """清理临时文件，释放磁盘空间（对应"清理空间"等语音指令）"""
     try:
@@ -885,6 +900,9 @@ def execute_intent(intent_name, slots, raw_text=''):
 
     if intent_name == 'cleanup_space':
         return cleanup_space()
+
+    if intent_name == 'web_search':
+        return web_search(slots.get('query', ''))
 
     if intent_name == 'get_time':
         return get_time()
