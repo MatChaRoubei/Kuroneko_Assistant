@@ -596,7 +596,7 @@ class SherpaONNXRecognizer:
             print(f'[监听] 录音错误: {e}')
             return False, str(e)
 
-    def _init_kws(self, keywords):
+    def _init_kws(self, keywords, sensitivity=None):
         """初始化 KeywordSpotter（低功耗唤醒词检测），模型不可用返回 None"""
         import os
         import glob
@@ -614,16 +614,33 @@ class SherpaONNXRecognizer:
         tokens = os.path.join(model_dir, 'tokens.txt')
         if not (encoder and decoder and joiner and os.path.exists(tokens)):
             return None
+        # 生成唤醒词文件（KeywordSpotter 需要 keywords_file，每行一个词）
+        keywords_file = os.path.join(model_dir, 'keywords.txt')
+        try:
+            with open(keywords_file, 'w', encoding='utf-8') as f:
+                for kw in keywords:
+                    f.write(kw + '\n')
+        except Exception:
+            return None
+        # 灵敏度 -> 阈值映射（sensitivity 0.1~1.0，越低越宽松、越容易误触发）
+        if sensitivity is None:
+            threshold = 0.25
+        else:
+            try:
+                threshold = max(0.05, min(0.5, float(sensitivity) * 0.5))
+            except Exception:
+                threshold = 0.25
         try:
             return sherpa_onnx.KeywordSpotter(
                 encoder=encoder[0],
                 decoder=decoder[0],
                 joiner=joiner[0],
                 tokens=tokens,
-                keywords=list(keywords),
+                keywords_file=keywords_file,
                 num_threads=2,
                 sample_rate=16000,
                 feature_dim=80,
+                keywords_threshold=threshold,
                 provider='cpu',
             )
         except Exception as e:
@@ -639,7 +656,7 @@ class SherpaONNXRecognizer:
         """
         if keywords is None:
             keywords = []
-        spotter = self._init_kws(keywords)
+        spotter = self._init_kws(keywords, sensitivity)
         if spotter is None:
             print('[KWS] 模型不可用，回退到滑动窗口识别')
             return self.listen_with_wake_word(keywords, on_wake, sensitivity)
