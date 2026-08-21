@@ -110,11 +110,10 @@ class SounddeviceMicrophone:
 
     def listen_until_silence(self, max_duration=15.0, silence_duration=1.2,
                              energy_threshold=None):
+        """持续录音：检测到语音开始后，直到静音结束。返回 (success, wav_bytes or error)"""
+        import time as _time
         if energy_threshold is None:
             energy_threshold = self.energy_threshold
-        """持续录音：检测到语音开始后，直到静音结束。
-        返回 (success, wav_bytes or error)"""
-        import time as _time
 
         rate = int(self.sample_rate)
         block = max(int(rate * 0.1), 256)  # 100ms 一片
@@ -325,32 +324,6 @@ class SpeechRecognizer:
             return False, f'语音识别服务出错: {e}'
         except Exception as e:
             return False, f'识别失败: {e}'
-        """
-        录制并识别一段语音，返回 (success, text or error_message)
-        """
-        ok, audio_or_error = self.microphone.listen(timeout=timeout, phrase_time_limit=phrase_time_limit)
-        if not ok:
-            return False, audio_or_error
-
-        audio_data = audio_or_error
-
-        try:
-            # 将 WAV 字节数据封装为 AudioFile（从内存）
-            audio_io = io.BytesIO(audio_data)
-            with sr.AudioFile(audio_io) as source:
-                audio = self.recognizer.record(source)
-
-            # 使用 Google 语音识别（需要网络），带重试
-            return self._recognize_with_retry(audio)
-
-        except sr.WaitTimeoutError:
-            return False, '监听超时，未检测到语音'
-        except sr.UnknownValueError:
-            return False, '无法识别语音内容'
-        except sr.RequestError as e:
-            return False, f'语音识别服务出错: {e}'
-        except Exception as e:
-            return False, f'识别失败: {e}'
 
     def listen_with_wake_word(self, wake_words=None, retries=2):
         """持续监听：检测语音 -> 录音到静音 -> 识别 -> 检查唤醒词。
@@ -428,6 +401,18 @@ class SpeechRecognizer:
             wake_word_detector.stop()
 
         return False, '唤醒词检测超时'
+
+
+def _block_to_wav(block, sample_rate):
+    """把一段 float32 单声道音频块转成 16-bit PCM 的 WAV 字节（供 VAD 检测用）。"""
+    audio_int16 = np.int16(np.clip(block, -1.0, 1.0) * 32767)
+    buf = io.BytesIO()
+    with wave.open(buf, 'wb') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(int(sample_rate))
+        wf.writeframes(audio_int16.tobytes())
+    return buf.getvalue()
 
 
 class SherpaONNXRecognizer:
@@ -533,14 +518,7 @@ class SherpaONNXRecognizer:
 
     def _block_to_wav(self, block):
         """把一段 float32 单声道音频块转成 16-bit PCM 的 WAV 字节（供 VAD 检测用）"""
-        audio_int16 = np.int16(np.clip(block, -1.0, 1.0) * 32767)
-        buf = io.BytesIO()
-        with wave.open(buf, 'wb') as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(int(self.sample_rate))
-            wf.writeframes(audio_int16.tobytes())
-        return buf.getvalue()
+        return _block_to_wav(block, self.sample_rate)
 
     def listen_once(self, timeout=5, phrase_time_limit=8):
         """录制并识别一段语音，返回 (success, text or error_message)。
@@ -803,15 +781,13 @@ class SherpaONNXRecognizer:
         start_time = time.time()
 
         try:
-            while time.time() - start_time < timeout:
-                ok, audio_or_err = self.microphone.listen(
-                    timeout=5,
-                    phrase_time_limit=0.5
-                )
-                if not ok:
-                    continue
-
-                if wake_word_detector.detect_from_bytes(audio_or_err):
+            # 流式读取 0.3s 短块并实时做 VAD 检测，延迟从「整段录音」降到单块粒度，
+            # 不再每轮都固定录制短片段空转
+            for block in self.microphone.iter_blocks(0.3):
+                if time.time() - start_time >= timeout:
+                    return False, '唤醒词检测超时'
+                if wake_word_detector.detect_from_bytes(
+                        _block_to_wav(block, self.microphone.sample_rate)):
                     wake_word_detector.stop()
                     return True, None
 

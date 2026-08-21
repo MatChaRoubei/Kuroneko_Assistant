@@ -1,5 +1,7 @@
 import os
 import sys
+import queue
+import time
 import subprocess
 import threading
 import ctypes
@@ -16,6 +18,15 @@ _pyttsx3_engine = None
 _pyttsx3_tried = False
 _vits_tts = None
 _vits_tried = False
+
+# TTS 队列与工作线程：避免每条播报都新建线程（减少线程抖动，连续播报更顺滑）
+_tts_queue = queue.Queue()
+_tts_worker = None
+# 引擎 -> 可重试的绝对时间戳（epoch）。失败后在 TTL 内跳过该引擎，
+# 离线时不再每条都卡网络超时去重试 edge-tts
+_tts_failed_engines = {}
+_tts_cache_lock = threading.Lock()
+_tts_engine_ttl = 60  # 秒
 
 
 def configure_tts(engine='auto', voice='zh-CN-XiaoxiaoNeural'):
@@ -249,29 +260,68 @@ def _speak_with_sapi(text):
 
 
 # ---------- 主入口 ----------
-def _speak(text):
+def _current_order():
+    """根据当前引擎偏好返回回退顺序"""
     if _engine_pref == 'edge':
-        order = ['edge', 'vits', 'pyttsx3', 'sapi']
-    elif _engine_pref == 'vits':
-        order = ['vits', 'edge', 'pyttsx3', 'sapi']
-    elif _engine_pref == 'pyttsx3':
-        order = ['pyttsx3', 'sapi']
-    else:  # auto：在线优先，断网回退本地，最后机械音兜底
-        order = ['edge', 'vits', 'pyttsx3', 'sapi']
+        return ['edge', 'vits', 'pyttsx3', 'sapi']
+    if _engine_pref == 'vits':
+        return ['vits', 'edge', 'pyttsx3', 'sapi']
+    if _engine_pref == 'pyttsx3':
+        return ['pyttsx3', 'sapi']
+    return ['edge', 'vits', 'pyttsx3', 'sapi']  # auto：在线优先，断网回退本地，最后机械音兜底
 
-    for engine in order:
+
+def _speak_cached(text):
+    """带引擎可用性缓存的播报：失败的引擎在 TTL 内跳过，离线时不再每条都卡网络超时重试。"""
+    for engine in _current_order():
+        now = time.time()
+        with _tts_cache_lock:
+            banned = _tts_failed_engines.get(engine)
+            if banned and now < banned:
+                continue
+        ok = False
         try:
-            if engine == 'edge' and _speak_with_edge(text):
-                return
-            if engine == 'vits' and _speak_with_vits(text):
-                return
-            if engine == 'pyttsx3' and _speak_with_pyttsx3(text):
-                return
-            if engine == 'sapi' and _speak_with_sapi(text):
-                return
+            if engine == 'edge':
+                ok = _speak_with_edge(text)
+            elif engine == 'vits':
+                ok = _speak_with_vits(text)
+            elif engine == 'pyttsx3':
+                ok = _speak_with_pyttsx3(text)
+            elif engine == 'sapi':
+                ok = _speak_with_sapi(text)
         except Exception as e:
             print(f'[TTS] {engine} 异常: {e}')
+            ok = False
+        if ok:
+            with _tts_cache_lock:
+                _tts_failed_engines.pop(engine, None)
+            return
+        with _tts_cache_lock:
+            _tts_failed_engines[engine] = time.time() + _tts_engine_ttl
     print('[TTS] 所有语音引擎均失败，仅保留文字输出')
+
+
+def _tts_worker_loop():
+    """后台 TTS 工作线程：从队列顺序取文本播报，避免每条都新建线程。"""
+    while True:
+        item = _tts_queue.get()
+        if item is None:
+            _tts_queue.task_done()
+            break
+        with _tts_lock:
+            _speaking.set()
+            try:
+                _speak_cached(item)
+            finally:
+                _speaking.clear()
+        _tts_queue.task_done()
+
+
+def _ensure_tts_worker():
+    global _tts_worker
+    if _tts_worker is None or not _tts_worker.is_alive():
+        _tts_worker = threading.Thread(target=_tts_worker_loop, daemon=True, name='tts-worker')
+        _tts_worker.start()
 
 
 def is_speaking():
@@ -281,14 +331,13 @@ def is_speaking():
 
 def wait_speaking_done(timeout=None):
     """等待语音播报结束（主循环在监听前调用，避免录入助手自己的回声）"""
-    import time as _time
     if timeout is None:
         while _speaking.is_set():
-            _time.sleep(0.05)
+            time.sleep(0.05)
     else:
-        end = _time.time() + timeout
-        while _speaking.is_set() and _time.time() < end:
-            _time.sleep(0.05)
+        end = time.time() + timeout
+        while _speaking.is_set() and time.time() < end:
+            time.sleep(0.05)
 
 
 def say_sync(text):
@@ -297,38 +346,31 @@ def say_sync(text):
     text = str(text or '').strip()
     if not text:
         return True
+    _ensure_tts_worker()
     with _tts_lock:
         _speaking.set()
         try:
-            _speak(text)
+            _speak_cached(text)
         finally:
             _speaking.clear()
     return True
 
 
 def say(text):
-    """语音播报文本，异步执行，避免阻塞主循环"""
+    """语音播报文本：放入队列由后台 TTS 工作线程顺序播报，避免每条都新建线程。"""
     print(f'[语音] {text}')
     text = str(text or '').strip()
     if not text:
         return True
 
-    # 先标记"正在播报"，避免主循环在播报线程真正开始前就进入监听
+    # 先标记"正在播报"，让主循环在真正开播前就停止监听（防回声）
     _speaking.set()
-
-    def _worker():
-        with _tts_lock:
-            _speaking.set()  # 锁内再标记，避免连续播报时标记被上一个 worker 误清
-            try:
-                _speak(text)
-            finally:
-                _speaking.clear()
-
+    _ensure_tts_worker()
     try:
-        threading.Thread(target=_worker, daemon=True).start()
+        _tts_queue.put(text)
     except Exception as e:
         _speaking.clear()
-        print(f'[TTS] 启动播报线程失败: {e}')
+        print(f'[TTS] 入队失败: {e}')
     return True
 
 

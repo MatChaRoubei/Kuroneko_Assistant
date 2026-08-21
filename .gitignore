@@ -33,3 +33,9 @@ settings.json
 model_selection.json
 temp/
 console.log
+
+# WorkBuddy internal tooling (agent workspace data)
+.workbuddy/
+
+# Large prebuilt binary backup (not source)
+VoiceAssistant_backup_0302.exe

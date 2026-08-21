@@ -235,6 +235,8 @@ def main():
                     if ok:
                         # VAD 检测到语音，唤醒成功，继续监听实际指令
                         say('我在')
+                        # 等"我在"播完再录音，避免把助手自己的声音录进去（回声）
+                        wait_speaking_done()
                         ok, query = recognizer.listen_once()
                         if not ok:
                             logger.warning(f'语音识别失败: {query}')

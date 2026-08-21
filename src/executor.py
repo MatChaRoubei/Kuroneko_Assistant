@@ -184,52 +184,63 @@ APP_SEARCH_PATHS = [
 ]
 
 
+_program_index = None  # 进程内缓存：exe 基名（小写）-> 完整路径，避免每次查询都全量遍历磁盘
+
+
+def _build_program_index():
+    """一次性扫描 Program Files 建立 exe 名索引并缓存复用，避免每次 open_app 都 os.walk。"""
+    global _program_index
+    if _program_index is not None:
+        return _program_index
+    index = {}
+    for base in [r'C:\Program Files', r'C:\Program Files (x86)']:
+        if not os.path.isdir(base):
+            continue
+        try:
+            for dirpath, dirnames, filenames in os.walk(base):
+                if dirpath.count(os.sep) - base.count(os.sep) > 3:
+                    dirnames[:] = []
+                    continue
+                for f in filenames:
+                    if not f.lower().endswith('.exe'):
+                        continue
+                    key = os.path.splitext(f)[0].lower()
+                    if key not in index:
+                        index[key] = os.path.join(dirpath, f)
+        except (OSError, PermissionError):
+            continue
+    _program_index = index
+    return index
+
+
 def find_app_in_program_files(app_name):
     normalized = app_name.strip().lower()
     if not normalized:
         return None
 
-    candidate_tokens = set()
-    candidate_tokens.add(normalized)
-    candidate_tokens.add(normalized.replace(' ', ''))
-    candidate_tokens.add(normalized.replace(' ', '').replace('程', ''))
+    index = _build_program_index()
 
+    # 1) 直接按 exe 基名命中
+    if normalized in index:
+        return index[normalized]
+    if normalized.endswith('.exe') and normalized[:-4] in index:
+        return index[normalized[:-4]]
+
+    # 2) 别名映射
     alias = APP_ALIAS_MAP.get(normalized)
-    if alias:
-        candidate_tokens.add(alias)
+    if alias and alias in index:
+        return index[alias]
 
-    # 部分名字可能提取为英文单词，如 微信->wechat、企业微信->wechatwork
+    # 3) 子串包含匹配（文件名包含 token）
+    candidate_tokens = {normalized, normalized.replace(' ', ''), normalized.replace(' ', '').replace('程', '')}
     if normalized in APP_ALIAS_MAP:
         candidate_tokens.add(APP_ALIAS_MAP[normalized])
-
-    for root in APP_SEARCH_PATHS:
-        if not root or not os.path.isdir(root):
+    for tok in candidate_tokens:
+        if not tok:
             continue
-        try:
-            for dirpath, dirnames, filenames in os.walk(root):
-                lower_path = dirpath.lower()
-                path_token_match = any(tok in lower_path for tok in candidate_tokens)
-                if path_token_match:
-                    for file in filenames:
-                        if not file.lower().endswith('.exe'):
-                            continue
-                        file_lower = file.lower()
-                        if any(tok in file_lower for tok in candidate_tokens):
-                            return os.path.join(dirpath, file)
-                else:
-                    # 如果当前目录直接包含可执行文件名关键字也算
-                    for file in filenames:
-                        if not file.lower().endswith('.exe'):
-                            continue
-                        file_lower = file.lower()
-                        if any(tok in file_lower for tok in candidate_tokens):
-                            return os.path.join(dirpath, file)
-
-                # 限制深度避免性能问题
-                if dirpath.count(os.sep) - root.count(os.sep) > 3:  # 减少深度
-                    dirnames[:] = []
-        except (OSError, PermissionError):
-            continue  # 跳过无权限目录
+        for key, path in index.items():
+            if tok in key:
+                return path
     return None
 
 
@@ -559,17 +570,23 @@ def configure_ollama(model=None):
     _ollama_model = (model or '').strip() or None
 
 
+_ollama_model_cache = None
+_ollama_model_cache_t = 0.0
+_ollama_model_cache_ttl = 60  # 秒：自动检测结果缓存时间，避免每轮对话都 ollama.list()
+
+
 def get_ollama_model():
     """返回当前 Ollama 模型名：优先用配置的模型，否则自动检测已部署模型。
 
-    自动检测不缓存，优先选非推理模型（如 qwen），deepseek-r1 这类
-    推理模型响应慢、会先输出思考过程，放到最后。因此在 Ollama 里
-    切换（部署/删除）模型后即可生效。
+    自动检测结果带 TTL 缓存（默认 60s），避免每一轮对话都调用 ollama.list()；
+    在 Ollama 里切换（部署/删除）模型后最长 60s 内生效。
     """
-    global _ollama_model
+    global _ollama_model, _ollama_model_cache, _ollama_model_cache_t
     if _ollama_model:
         return _ollama_model  # 配置了具体模型，优先使用
-    # 未配置：每次自动检测（感知 Ollama 模型切换）
+    now = time.time()
+    if _ollama_model_cache and now - _ollama_model_cache_t < _ollama_model_cache_ttl:
+        return _ollama_model_cache
     try:
         models = ollama.list()
         names = [m.model for m in (models.models or [])]
@@ -578,7 +595,11 @@ def get_ollama_model():
             for n in names:
                 if 'deepseek-r1' in n.lower():
                     continue
+                _ollama_model_cache = n
+                _ollama_model_cache_t = now
                 return n
+            _ollama_model_cache = names[0]
+            _ollama_model_cache_t = now
             return names[0]
     except Exception:
         pass
@@ -841,7 +862,7 @@ def web_search(query):
     query = (query or '').strip()
     if not query:
         return False, '请告诉我要搜索的内容，例如「搜索一下 Python 教程」'
-    url = 'https://www.baidu.com/s?wd=' + urllib.parse.quote(query)
+    url = 'https://www.bing.com/search?q=' + urllib.parse.quote(query)
     try:
         import webbrowser
         webbrowser.open(url)
