@@ -66,7 +66,8 @@ def save_chat_history():
     """把长期记忆写入磁盘"""
     try:
         with open(_get_memory_file(), 'w', encoding='utf-8') as f:
-            json.dump(chat_history, f, ensure_ascii=False, indent=2)
+            # default=str 兜底：即使混入不可序列化对象也不会崩溃
+            json.dump(chat_history, f, ensure_ascii=False, indent=2, default=str)
     except (OSError, IOError) as e:
         print(f'保存记忆失败: {e}')
 
@@ -684,6 +685,24 @@ def _search_web(query, max_results=5):
         return False, f'搜索失败: {e}'
 
 
+def _to_plain(obj):
+    """递归把对象转成纯 JSON 可序列化的 dict/list（处理 ToolCall 等对象）"""
+    if isinstance(obj, dict):
+        return {k: _to_plain(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_plain(x) for x in obj]
+    if hasattr(obj, 'model_dump'):
+        try:
+            return _to_plain(obj.model_dump(exclude_none=True))
+        except Exception:
+            pass
+    if hasattr(obj, '__dict__'):
+        return _to_plain(vars(obj))
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    return str(obj)
+
+
 def _execute_tool(name, args):
     """执行 agent 调用的工具"""
     try:
@@ -704,6 +723,20 @@ def _execute_tool(name, args):
         return False, f'工具执行失败: {e}'
 
 
+def _sanitize_history():
+    """清理 chat_history 中无法 JSON 序列化的内容（如残留的 ToolCall 对象）"""
+    global chat_history
+    clean = []
+    for msg in chat_history:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get('role')
+        if role in ('system', 'user', 'assistant'):
+            clean.append({'role': role, 'content': str(msg.get('content') or '')})
+        # 'tool' 角色的消息在回退普通聊天时直接丢弃（不带工具调用上下文无法配对）
+    chat_history = clean
+
+
 def _run_ai_agent(user_input):
     """AI agent：通过 function calling 让模型自主调用工具"""
     load_chat_history()
@@ -713,6 +746,8 @@ def _run_ai_agent(user_input):
     except Exception as e:
         # 模型不支持 function calling 等情况，回退到普通流式聊天
         print(f'[Agent] function calling 不可用，回退普通聊天: {e}')
+        # 回退前清理历史中可能残留的工具调用消息，避免二次序列化失败
+        _sanitize_history()
         return _stream_chat()
 
 
@@ -732,7 +767,14 @@ def _agent_loop():
             tools=TOOLS,
         )
         message = response['message']
-        tool_calls = message.get('tool_calls', [])
+        # 新版 ollama 库返回 pydantic 对象（Message/ToolCall），
+        # 必须转成纯 dict，否则后续 JSON 序列化会报
+        # "Object of type ToolCall is not JSON serializable"
+        if hasattr(message, 'model_dump'):
+            message = message.model_dump(exclude_none=True)
+        elif not isinstance(message, dict):
+            message = dict(message)
+        tool_calls = _to_plain(message.get('tool_calls') or [])
 
         if not tool_calls:
             reply = (message.get('content') or '').strip() or '（无回复）'
@@ -748,7 +790,7 @@ def _agent_loop():
 
         # 执行工具并把结果反馈给模型
         for tc in tool_calls:
-            fn = tc.get('function', {})
+            fn = tc.get('function', {}) if isinstance(tc, dict) else {}
             name = fn.get('name', '')
             args = fn.get('arguments', {})
             if isinstance(args, str):
@@ -758,7 +800,8 @@ def _agent_loop():
                 except Exception:
                     args = {}
             ok, result = _execute_tool(name, args)
-            chat_history.append({'role': 'tool', 'content': result})
+            # tool 消息需要带 tool_name（新版 ollama 库的格式要求）
+            chat_history.append({'role': 'tool', 'tool_name': name or 'unknown', 'content': str(result)})
 
     if not reply:
         reply = '（未获得回复）'
