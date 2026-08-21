@@ -2,6 +2,16 @@
 
 一个常驻后台的 Windows 语音助手：持续监听唤醒词，听到「你好黑猫」后即可下达指令。支持语音控制 Windows、AI 大模型对话（Ollama）、磁盘清理等，带图形主窗口和系统托盘图标。
 
+## 下载
+
+预编译的单文件版本（含全部模型依赖，开箱即用）：
+
+- **v0.0.2 性能优化与重构版**：[VoiceAssistant.exe（约 455 MB）](https://github.com/MatChaRoubei/Kuroneko_Assistant/releases/download/v0.0.2/VoiceAssistant.exe)
+  - 发布页（含变更说明）：<https://github.com/MatChaRoubei/Kuroneko_Assistant/releases/tag/v0.0.2>
+  - 该版本已做语音识别/播报/执行链路的性能优化与代码重构，详见文末「性能优化与重构」章节。
+
+> 说明：打包产物体积较大（含 SenseVoice + VITS 等模型），不纳入 Git 仓库，仅作为 GitHub Release 附件分发。若要自行构建，见下文「打包」章节。
+
 ## 功能特性
 
 ### 唤醒与识别
