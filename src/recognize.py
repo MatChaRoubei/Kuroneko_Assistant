@@ -885,7 +885,42 @@ class SherpaONNXRecognizer:
         return False, 'KWS 监听结束'
 
     def _listen_command_after_wake(self):
-        """唤醒后监听一条指令（VAD 端点检测，说完即停 + SenseVoice 识别）"""
+        """唤醒后监听一条指令（VAD 端点检测，说完即停 + SenseVoice 识别）
+
+        唤醒播报（如「我在」）经扬声器播出后会被麦克风拾取，若立刻收音就会把
+        回声识别成「你好」等误触发。因此收音前必须：
+          1. 等 TTS 完全播完（wait_speaking_done）；
+          2. 再做「静音预检」：轮询麦克风直到连续静音（回声/尾音消散）才起步；
+        之后才启动 VAD 收音。
+        """
+        import time as _t
+        # 1) 等唤醒应答播报结束
+        try:
+            from src.feedback import wait_speaking_done
+            wait_speaking_done(timeout=8.0)
+        except Exception:
+            pass
+
+        # 2) 静音预检：等到麦克风真正安静（回声/设备尾音消散）再收音，
+        #    避免把「我在」的尾音直接录入。最多等 3s，超时则直接尝试收音。
+        try:
+            threshold = self.microphone.energy_threshold
+            quiet_needed = 0.3          # 需连续静音的时长
+            quiet_accum = 0.0
+            deadline = _t.time() + 3.0
+            for block in self.microphone.iter_blocks(0.1):
+                energy = float(np.sqrt(np.mean(block.astype(np.float64) ** 2)))
+                if energy <= threshold:
+                    quiet_accum += 0.1
+                    if quiet_accum >= quiet_needed:
+                        break
+                else:
+                    quiet_accum = 0.0
+                if _t.time() > deadline:
+                    break
+        except Exception as e:
+            print(f'[监听] 静音预检跳过: {e}')
+
         while True:
             ok, wav = self.microphone.listen_until_silence(
                 max_duration=8.0, silence_duration=1.0
