@@ -201,6 +201,8 @@ class MainWindow:
             canvas.create_window(W // 2, H - 28, window=btn)
 
             self.append_system('黑猫语音助手已启动，说「你好黑猫」唤醒')
+            # 关闭窗口 = 隐藏到托盘，而不是退出进程
+            self.root.protocol('WM_DELETE_WINDOW', self._on_close)
             self.root.mainloop()
         except Exception as e:
             print(f'[GUI] 主窗口启动失败: {e}')
@@ -211,6 +213,24 @@ class MainWindow:
 
     def _on_settings(self):
         show_settings()
+
+    def _on_close(self):
+        """关闭窗口 = 隐藏到托盘，程序继续后台运行"""
+        if self.root:
+            try:
+                self.root.withdraw()
+            except Exception:
+                pass
+
+    def show(self):
+        """显示窗口（从托盘唤起）"""
+        if self.root:
+            try:
+                self.root.deiconify()
+                self.root.lift()
+                self.root.focus_force()
+            except Exception:
+                pass
 
     def _on_exit(self):
         os._exit(0)
@@ -454,6 +474,13 @@ def start_main_window():
         return
     _ui = MainWindow()
     threading.Thread(target=_ui.run, daemon=True, name='main-ui').start()
+
+
+def show_window():
+    """显示主窗口（托盘点击/菜单调用）"""
+    global _ui
+    if _ui is not None:
+        _ui.show()
 
 
 def set_status(text):

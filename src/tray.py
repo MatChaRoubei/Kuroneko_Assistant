@@ -60,6 +60,15 @@ def _on_model_settings(icon, item):
         print(f'[托盘] 打开模型设置失败: {e}')
 
 
+def _on_show_window(icon, item):
+    """托盘菜单「显示窗口」/左键点击：唤起主窗口"""
+    try:
+        from src.gui import show_window
+        show_window()
+    except Exception as e:
+        print(f'[托盘] 显示窗口失败: {e}')
+
+
 def start_tray():
     """启动托盘图标（后台线程），返回 icon 对象或 None"""
     global _icon
@@ -72,6 +81,7 @@ def start_tray():
         image = _load_image()
         menu = pystray.Menu(
             pystray.MenuItem('黑猫语音助手（运行中）', None, enabled=False),
+            pystray.MenuItem('显示窗口', _on_show_window, default=True),  # 左键单击唤起
             pystray.MenuItem('模型设置', _on_model_settings),
             pystray.MenuItem('说「你好黑猫」唤醒', _on_show),
             pystray.MenuItem('退出', _on_exit),
