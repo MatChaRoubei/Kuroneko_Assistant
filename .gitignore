@@ -33,6 +33,7 @@ settings.json
 model_selection.json
 temp/
 console.log
+debug_report.txt
 
 # WorkBuddy internal tooling (agent workspace data)
 .workbuddy/
