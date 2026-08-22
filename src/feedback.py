@@ -47,7 +47,7 @@ _tts_engine_ttl = 60  # 秒
 
 
 def configure_tts(engine='auto', voice='zh-CN-XiaoxiaoNeural',
-                  style='calm', rate='-12%', pitch='-6%'):
+                  style='calm', rate='-5%', pitch='0%'):
     """设置 TTS 引擎偏好：auto / edge / vits / pyttsx3，以及 Edge 感情风格/语速/音调"""
     global _engine_pref, _edge_voice, _EDGE_STYLE, _EDGE_RATE, _EDGE_PITCH
     if engine:
@@ -135,8 +135,8 @@ def _play_mp3(path):
 # ---------- 引擎1：edge-tts（微软神经网络语音，在线，音质最自然） ----------
 # 感情风格与语调：平静慵懒的黑猫人设（calm 风格 + 略慢略低）
 _EDGE_STYLE = 'calm'      # affectionate / gentle / calm / chat 等
-_EDGE_RATE = '-12%'       # 语速放慢，更松弛慵懒
-_EDGE_PITCH = '-6%'       # 音调略降，更沉稳
+_EDGE_RATE = '-5%'        # 语速：轻微放慢更从容；过慢(-12%)会显人机、拖沓
+_EDGE_PITCH = '0%'        # 音调：保持基准；负降调会让女声发闷不自然
 
 
 def _speak_with_edge(text):
@@ -160,6 +160,10 @@ def _speak_with_edge(text):
                 voice=_edge_voice,
                 rate=_EDGE_RATE,
                 pitch=_EDGE_PITCH,
+                # 国内连微软境外节点经常慢/不稳：连线 4s、接收 12s 超时，
+                # 超时即快速失败回退到本地引擎，避免答案已显示却迟迟不读
+                connect_timeout=4,
+                receive_timeout=12,
             )
             asyncio.run(communicate.save(mp3_path))
             _play_mp3(mp3_path)
@@ -337,6 +341,7 @@ def _speak_cached(text):
         if ok:
             with _tts_cache_lock:
                 _tts_failed_engines.pop(engine, None)
+            print(f'[TTS] 已使用 {engine} 引擎播报')
             return
         with _tts_cache_lock:
             _tts_failed_engines[engine] = time.time() + _tts_engine_ttl
