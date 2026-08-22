@@ -13,6 +13,23 @@ _speaking = threading.Event()
 _engine_pref = 'auto'
 _edge_voice = 'zh-CN-XiaoxiaoNeural'
 
+# 感情风格与语调（GUI 可调，configure_tts 设置）
+# 风格：映射到 Edge mstts:express-as 的 style 值
+_EDGE_STYLE = 'calm'      # affectionate / gentle / calm / chat / cheerful 等
+_EDGE_RATE = '-12%'       # 语速：相对基准的快慢，如 -20% ~ +20%
+_EDGE_PITCH = '-6%'       # 音调：相对基准的高低，如 -20% ~ +20%
+
+# 风格显示名 -> Edge style 值（供 GUI 下拉使用）
+EDGE_STYLE_OPTIONS = {
+    '平静慵懒 (calm)': 'calm',
+    '温柔 (gentle)': 'gentle',
+    '亲昵 (affectionate)': 'affectionate',
+    '聊天 (chat)': 'chat',
+    '开心 (cheerful)': 'cheerful',
+    '叙述 (narration-relaxed)': 'narration-relaxed',
+    '不加风格 (none)': 'none',
+}
+
 # 惰性缓存
 _pyttsx3_engine = None
 _pyttsx3_tried = False
@@ -29,13 +46,20 @@ _tts_cache_lock = threading.Lock()
 _tts_engine_ttl = 60  # 秒
 
 
-def configure_tts(engine='auto', voice='zh-CN-XiaoxiaoNeural'):
-    """设置 TTS 引擎偏好：auto / edge / vits / pyttsx3"""
-    global _engine_pref, _edge_voice
+def configure_tts(engine='auto', voice='zh-CN-XiaoxiaoNeural',
+                  style='calm', rate='-12%', pitch='-6%'):
+    """设置 TTS 引擎偏好：auto / edge / vits / pyttsx3，以及 Edge 感情风格/语速/音调"""
+    global _engine_pref, _edge_voice, _EDGE_STYLE, _EDGE_RATE, _EDGE_PITCH
     if engine:
         _engine_pref = engine
     if voice:
         _edge_voice = voice
+    if style:
+        _EDGE_STYLE = style
+    if rate:
+        _EDGE_RATE = rate
+    if pitch:
+        _EDGE_PITCH = pitch
 
 
 _wake_audio = None  # 预生成的唤醒反馈音频 (samples, sample_rate)
@@ -109,6 +133,30 @@ def _play_mp3(path):
 
 
 # ---------- 引擎1：edge-tts（微软神经网络语音，在线，音质最自然） ----------
+# 感情风格与语调：平静慵懒的黑猫人设（calm 风格 + 略慢略低）
+_EDGE_STYLE = 'calm'      # affectionate / gentle / calm / chat 等
+_EDGE_RATE = '-12%'       # 语速放慢，更松弛慵懒
+_EDGE_PITCH = '-6%'       # 音调略降，更沉稳
+
+
+def _edge_ssml(text):
+    """把纯文本包装成带感情风格与语调的 SSML，让 Edge 神经语音更有感情。"""
+    import xml.sax.saxutils as su
+    safe = su.escape(text)
+    # 风格包裹：none 时不加 express-as，纯靠 prosody 调语调
+    if _EDGE_STYLE and _EDGE_STYLE != 'none':
+        express = (f'<mstts:express-as style="{_EDGE_STYLE}">'
+                   f'<prosody rate="{_EDGE_RATE}" pitch="{_EDGE_PITCH}">{safe}</prosody>'
+                   '</mstts:express-as>')
+    else:
+        express = f'<prosody rate="{_EDGE_RATE}" pitch="{_EDGE_PITCH}">{safe}</prosody>'
+    return (
+        '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" '
+        'xmlns:mstts="https://www.w3.org/2001/mstts" xml:lang="zh-CN">'
+        f'<voice name="{_edge_voice}">{express}</voice></speak>'
+    )
+
+
 def _speak_with_edge(text):
     try:
         import asyncio
@@ -121,7 +169,9 @@ def _speak_with_edge(text):
         if register_active_file:
             register_active_file(mp3_path)  # 标记正在使用，清理时跳过
         try:
-            asyncio.run(edge_tts.Communicate(text, voice=_edge_voice).save(mp3_path))
+            # 用 SSML 注入感情风格与语调（平静慵懒），比纯文本更有感情
+            communicate = edge_tts.Communicate(_edge_ssml(text), voice=_edge_voice)
+            asyncio.run(communicate.save(mp3_path))
             _play_mp3(mp3_path)
             return True
         finally:
@@ -263,12 +313,14 @@ def _speak_with_sapi(text):
 def _current_order():
     """根据当前引擎偏好返回回退顺序"""
     if _engine_pref == 'edge':
-        return ['edge', 'vits', 'pyttsx3', 'sapi']
+        return ['edge', 'pyttsx3', 'sapi', 'vits']
     if _engine_pref == 'vits':
         return ['vits', 'edge', 'pyttsx3', 'sapi']
     if _engine_pref == 'pyttsx3':
         return ['pyttsx3', 'sapi']
-    return ['edge', 'vits', 'pyttsx3', 'sapi']  # auto：在线优先，断网回退本地，最后机械音兜底
+    # auto：在线神经语音优先；断网时掉到本地机械音(pyttsx3/sapi)
+    # 而非气泡音 vits（melo-tts 中文发虚发飘、自然度差），vits 仅作最后兜底
+    return ['edge', 'pyttsx3', 'sapi', 'vits']
 
 
 def _speak_cached(text):

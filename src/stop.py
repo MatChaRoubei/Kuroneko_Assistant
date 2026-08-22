@@ -94,3 +94,63 @@ def _listen_voice(recognizer, stop_words=None):
                             break
         except Exception:
             pass
+
+
+# ---------- 打断（barge-in）：播放期间检测主人开口即中断 ----------
+_barge_in_thread = None
+
+
+def start_barge_in_listener(recognizer):
+    """启动打断监听：播放/生成期间并行用麦克风能量检测，主人一开口就中断当前播报。
+
+    与停止词监听不同，barge-in 不要求说出特定停止词，只要检测到语音能量
+    （主人开始说话）即 clear_speaking() + request_stop()。
+    复用 recognizer.microphone 做轻量能量轮询，不调用识别 API，开销低。
+    """
+    global _barge_in_thread
+    if _barge_in_thread is not None and _barge_in_thread.is_alive():
+        return
+    if recognizer is None:
+        return
+    mic = getattr(recognizer, 'microphone', None)
+    if mic is None:
+        return
+    _barge_in_thread = threading.Thread(
+        target=_barge_in_loop, args=(mic,), daemon=True
+    )
+    _barge_in_thread.start()
+
+
+def _barge_in_loop(mic):
+    import numpy as np
+    energy_threshold = getattr(mic, 'energy_threshold', 0.02)
+    # 放大阈值：播放期间环境可能有助手回声，稍提高灵敏度避免误触，但不至于完全失效
+    trigger = max(energy_threshold * 3, 0.05)
+    chunk = 0.2  # 每次读 0.2s 音频块做能量判断
+    sr = getattr(mic, 'sample_rate', 16000)
+    n = int(chunk * sr)
+    try:
+        import sounddevice as sd
+    except Exception:
+        return
+    dev = getattr(mic, 'device', None)
+    while not OUTPUT_DONE.is_set() and not STOP_REQUESTED.is_set():
+        try:
+            audio = sd.rec(n, samplerate=sr, channels=1, dtype='float32', device=dev)
+            sd.wait()
+            peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+            if peak > trigger:
+                print(f'[barge-in] 检测到主人开口（能量 {peak:.3f}），中断当前播报')
+                # 清掉待播队列并请求停止；正在播的这一句由播放层自然结束
+                try:
+                    from src.feedback import clear_speaking
+                    clear_speaking()
+                except Exception:
+                    pass
+                request_stop()
+                break
+        except Exception:
+            # 麦克风被占用或其他异常：短暂退避后重试，不致命
+            time.sleep(0.3)
+    global _barge_in_thread
+    _barge_in_thread = None

@@ -57,6 +57,134 @@ def _get_memory_file():
     return _memory_file
 
 
+def _get_long_term_file():
+    """返回长期记忆库（结构化事实）文件路径，与对话历史同目录"""
+    if getattr(sys, 'frozen', False):
+        base = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        try:
+            from .config import get_resource_root
+        except ImportError:
+            from config import get_resource_root
+        base = get_resource_root()
+    return os.path.join(base, 'long_term_memory.json')
+
+
+# ---------- 长期记忆库（GPT 式跨会话事实库，每轮轻量抽取） ----------
+# 结构：{"facts": [{"key": "...", "value": "...", "confidence": int, "updated": "ISO时间"}]}
+_LT_MARK = '[长期记忆] '
+
+
+def load_long_term_memory():
+    """加载长期记忆库，返回 facts 列表（空列表表示无）"""
+    try:
+        with open(_get_long_term_file(), 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                return data.get('facts', []) or []
+    except (OSError, IOError, json.JSONDecodeError):
+        pass
+    return []
+
+
+def save_long_term_memory(facts):
+    """写入长期记忆库"""
+    try:
+        with open(_get_long_term_file(), 'w', encoding='utf-8') as f:
+            json.dump({'facts': facts}, f, ensure_ascii=False, indent=2, default=str)
+    except (OSError, IOError) as e:
+        print(f'[长期记忆] 保存失败: {e}')
+
+
+def _render_long_term_prompt(facts):
+    """把长期记忆渲染成 system 提示文本"""
+    if not facts:
+        return ''
+    lines = [f'{_LT_MARK}以下是关于主人的长期记忆，请始终遵守/参考：']
+    for fct in facts:
+        key = fct.get('key', '')
+        val = fct.get('value', '')
+        if key and val:
+            lines.append(f'- {key}：{val}')
+    return '\n'.join(lines)
+
+
+def _update_long_term_memory(recent_messages):
+    """每轮轻量抽取：把最近若干轮对话交给本地模型，抽取值得长期记住的事实并 upsert。
+
+    recent_messages: 本次新增的对话消息（user/assistant）。
+    仅对最近 4 条做抽取，prompt 要求只回 JSON、无则回空数组，成本低。
+    失败/无事实则不动库。
+    """
+    if not recent_messages:
+        return
+    # 仅取最近 4 条 user/assistant 内容
+    recent = [m for m in recent_messages if isinstance(m, dict) and m.get('role') in ('user', 'assistant')]
+    recent = recent[-4:]
+    if not recent:
+        return
+    convo = '\n'.join(f"{m['role']}: {m.get('content', '')}" for m in recent)
+    sys_prompt = (
+        '你是记忆抽取器。从下面的对话中，抽取「值得长期记住的关于用户的事实、偏好、习惯、约定、称呼」，'
+        '例如：用户姓名、喜好、作息、禁忌、与助手(黑猫)的约定等。\n'
+        '只输出 JSON 数组，每个元素格式：{"key":"简短类别","value":"具体事实"}。\n'
+        'key 要可复用（如"称呼""饮品偏好""禁忌"），相同 key 的新事实会覆盖旧的。\n'
+        '如果没有值得长期记住的内容，输出 []。不要输出任何解释文字，只输出 JSON。'
+    )
+    try:
+        resp = ollama.chat(
+            model=get_ollama_model(),
+            messages=[
+                {'role': 'system', 'content': sys_prompt},
+                {'role': 'user', 'content': convo},
+            ],
+        )
+        msg = resp.get('message') if isinstance(resp, dict) else None
+        if hasattr(msg, 'model_dump'):
+            msg = msg.model_dump(exclude_none=True)
+        raw = (msg.get('content') if isinstance(msg, dict) else None) or ''
+        # 容错：抽取 ```json ... ``` 或裸数组
+        raw = raw.strip()
+        if raw.startswith('```'):
+            raw = raw.strip('`')
+            if raw.lower().startswith('json'):
+                raw = raw[4:]
+        import re as _re
+        m = _re.search(r'\[.*\]', raw, _re.DOTALL)
+        if not m:
+            return
+        new_facts = json.loads(m.group(0))
+        if not isinstance(new_facts, list) or not new_facts:
+            return
+        facts = load_long_term_memory()
+        by_key = {f.get('key'): f for f in facts if isinstance(f, dict) and f.get('key')}
+        now = time.strftime('%Y-%m-%dT%H:%M:%S')
+        added = 0
+        for nf in new_facts:
+            if not isinstance(nf, dict):
+                continue
+            k = (nf.get('key') or '').strip()
+            v = (nf.get('value') or '').strip()
+            if not k or not v:
+                continue
+            existing = by_key.get(k)
+            if existing:
+                existing['value'] = v
+                existing['confidence'] = int(existing.get('confidence', 1)) + 1
+                existing['updated'] = now
+            else:
+                rec = {'key': k, 'value': v, 'confidence': 1, 'updated': now}
+                facts.append(rec)
+                by_key[k] = rec
+                added += 1
+        if added or any(f.get('updated') == now for f in facts):
+            save_long_term_memory(facts)
+            if added:
+                print(f'[长期记忆] 新增/更新 {added} 条事实，当前共 {len(facts)} 条')
+    except Exception as e:
+        print(f'[长期记忆] 抽取失败（不影响对话）: {e}')
+
+
 def load_chat_history():
     """从磁盘加载长期记忆"""
     global chat_history, _memory_loaded
@@ -71,28 +199,204 @@ def load_chat_history():
     except (OSError, IOError, json.JSONDecodeError):
         chat_history = []
     _ensure_system_prompt()
+    _inject_long_term_into_history()
+
+
+def _inject_long_term_into_history():
+    """把长期记忆库渲染成一条 system 消息，插入到人设提示之后（不持久化到 chat_memory.json）。"""
+    global chat_history
+    # 先剥掉上一次注入的长期记忆 system 消息（避免重复叠加）
+    chat_history = [m for m in chat_history
+                    if not (isinstance(m, dict) and m.get('role') == 'system'
+                            and str(m.get('content', '')).startswith(_LT_MARK))]
+    facts = load_long_term_memory()
+    prompt = _render_long_term_prompt(facts)
+    if prompt:
+        # 插在人设 system（第一条）之后
+        if chat_history and chat_history[0].get('role') == 'system':
+            chat_history.insert(1, {'role': 'system', 'content': prompt})
+        else:
+            chat_history.insert(0, {'role': 'system', 'content': prompt})
 
 
 def save_chat_history():
-    """把长期记忆写入磁盘"""
+    """把对话历史写入磁盘（长期记忆 system 消息不持久化，避免每轮叠加重复）"""
     try:
+        persistent = [m for m in chat_history
+                      if not (isinstance(m, dict) and m.get('role') == 'system'
+                              and str(m.get('content', '')).startswith(_LT_MARK))]
         with open(_get_memory_file(), 'w', encoding='utf-8') as f:
             # default=str 兜底：即使混入不可序列化对象也不会崩溃
-            json.dump(chat_history, f, ensure_ascii=False, indent=2, default=str)
+            json.dump(persistent, f, ensure_ascii=False, indent=2, default=str)
     except (OSError, IOError) as e:
         print(f'保存记忆失败: {e}')
 
 
 def clear_chat_history():
-    """清空长期记忆"""
+    """清空长期记忆（对话历史 + 长期事实库一并清空）"""
     global chat_history
     chat_history = []
     try:
         os.remove(_get_memory_file())
     except (OSError, IOError):
         pass
+    try:
+        os.remove(_get_long_term_file())
+    except (OSError, IOError):
+        pass
     _ensure_system_prompt()
     return True, '已清空记忆'
+
+
+def _handle_remember(content):
+    """显式记住：把用户的话当作一轮对话，复用轻量抽取 upsert 进长期记忆库。"""
+    if not content:
+        return False, '没听清要记住什么'
+    before = len(load_long_term_memory())
+    # 复用每轮抽取逻辑：把 content 当 user 消息喂入，模型归纳成 key/value
+    _update_long_term_memory([{'role': 'user', 'content': content}])
+    after = len(load_long_term_memory())
+    if after > before:
+        return True, '好的，我记住了。喵'
+    # 抽取没有产出结构化事实时，兜底整句存为一条
+    facts = load_long_term_memory()
+    by_key = {f.get('key'): f for f in facts if isinstance(f, dict) and f.get('key')}
+    now = time.strftime('%Y-%m-%dT%H:%M:%S')
+    rec = {'key': '用户提及', 'value': content, 'confidence': 1, 'updated': now}
+    facts.append(rec)
+    by_key['用户提及'] = rec
+    save_long_term_memory(facts)
+    return True, '好的，我记下了。喵'
+
+
+def _handle_forget(content):
+    """显式忘记：按内容匹配长期记忆库中的 key/value 并删除。"""
+    if not content:
+        return False, '没听清要忘记什么'
+    facts = load_long_term_memory()
+    if not facts:
+        return True, '我本来就没记着什么。喵'
+    # 尝试让模型抽出 key，并按 key 删；抽不到就按原文子串匹配
+    target_key = None
+    try:
+        resp = ollama.chat(
+            model=get_ollama_model(),
+            messages=[
+                {'role': 'system', 'content': '从下面这句话抽取要遗忘的记忆类别 key（简短），只回一个词，无则回空。'},
+                {'role': 'user', 'content': content},
+            ],
+        )
+        msg = resp.get('message') if isinstance(resp, dict) else None
+        if hasattr(msg, 'model_dump'):
+            msg = msg.model_dump(exclude_none=True)
+        target_key = (msg.get('content') if isinstance(msg, dict) else None) or ''
+        target_key = target_key.strip().strip('`').strip()
+    except Exception:
+        target_key = None
+    removed = []
+    kept = []
+    for f in facts:
+        k = str(f.get('key', ''))
+        v = str(f.get('value', ''))
+        if (target_key and target_key and (target_key in k or target_key in v)) \
+                or content in k or content in v:
+            removed.append(f)
+        else:
+            kept.append(f)
+    if removed:
+        save_long_term_memory(kept)
+        return True, f'忘了，已经把关于「{removed[0].get("key", "")}」的记忆删掉了。喵'
+    return True, '没找到对应的记忆，可能本来就没记。喵'
+
+
+# ---------- 摘要记忆（长程记忆压缩，避免暴力截断丢人设） ----------
+# 触发阈值：历史消息条数超过该值时，把最旧的部分压缩成一段摘要
+_HISTORY_COMPACT_THRESHOLD = 24
+# 压缩后保留的最近完整轮次（这些不被摘要，保证人设/当前话题不丢）
+_HISTORY_KEEP_RECENT = 12
+# 已有的摘要标记（role=system，content 以此开头表示是历史摘要）
+_SUMMARY_MARK = '[历史摘要] '
+
+
+def _extract_existing_summary(history):
+    """从历史里取出现有摘要文本（用于增量摘要：旧摘要 + 新对话 -> 新摘要）"""
+    for msg in history:
+        if isinstance(msg, dict) and msg.get('role') == 'system' \
+                and str(msg.get('content', '')).startswith(_SUMMARY_MARK):
+            return str(msg.get('content', ''))[len(_SUMMARY_MARK):]
+    return None
+
+
+def _build_summary(old_history, existing_summary=None):
+    """调用本地模型把旧对话压成摘要。失败返回 None（调用方保留原历史，不丢记忆）。"""
+    try:
+        pieces = []
+        if existing_summary:
+            pieces.append({
+                'role': 'system',
+                'content': '这是已有的历史摘要，请在其基础上合并新内容，不要重复。',
+            })
+            pieces.append({'role': 'user', 'content': existing_summary})
+            pieces.append({'role': 'assistant', 'content': '好的，我已记住。'})
+        pieces.append({
+            'role': 'system',
+            'content': (
+                '请把以下对话浓缩成一段简洁的记忆摘要，用于长期记忆。'
+                '必须保留：用户的人名/称呼、明确偏好与习惯、未完成的事项、'
+                '与助手（黑猫）相关的人设约束。只总结对话中真实出现的内容，不要编造。'
+                '用中文、第三人称、条理清晰。'
+            ),
+        })
+        # 只把旧对话内容喂给模型，去掉 role 之外的冗余字段
+        for msg in old_history:
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get('role')
+            content = msg.get('content')
+            if role in ('user', 'assistant', 'tool') and content:
+                pieces.append({'role': role, 'content': str(content)})
+        resp = ollama.chat(model=get_ollama_model(), messages=pieces)
+        msg = resp.get('message') if isinstance(resp, dict) else None
+        if hasattr(msg, 'model_dump'):
+            msg = msg.model_dump(exclude_none=True)
+        summary = (msg.get('content') if isinstance(msg, dict) else None) or ''
+        summary = summary.strip()
+        return summary or None
+    except Exception as e:
+        print(f'[记忆] 摘要生成失败，保留原历史: {e}')
+        return None
+
+
+def compact_history():
+    """当历史过长时，把最旧的对话压缩成一段 system 摘要，保留最近若干轮完整。
+
+    采用增量摘要：若已有摘要则在其基础上合并，避免反复全量重压。
+    失败时不修改历史（记忆不丢）。
+    """
+    global chat_history
+    if len(chat_history) <= _HISTORY_COMPACT_THRESHOLD:
+        return
+    existing_summary = _extract_existing_summary(chat_history)
+    # 找到第一个非摘要 system 之外的、需要压缩的旧消息边界
+    # 保留最近 _HISTORY_KEEP_RECENT 条，其余（除已有摘要 system）进压缩集
+    recent = chat_history[-_HISTORY_KEEP_RECENT:]
+    old = chat_history[:-_HISTORY_KEEP_RECENT]
+    # 已有摘要本身不算旧对话，从 old 中剔除，避免重复压缩
+    old_for_model = [m for m in old
+                     if not (isinstance(m, dict) and m.get('role') == 'system'
+                             and str(m.get('content', '')).startswith(_SUMMARY_MARK))]
+    if not old_for_model:
+        # 没有可压缩的旧对话（比如刚好只有摘要+近期），无需操作
+        return
+    summary = _build_summary(old_for_model, existing_summary)
+    if not summary:
+        return  # 压缩失败，原样保留
+    new_summary_msg = {'role': 'system', 'content': _SUMMARY_MARK + summary}
+    # 组装：新摘要 + 最近保留的轮次；若 recent 里已有系统人设提示则保留在首位
+    system_prompts = [m for m in recent if isinstance(m, dict) and m.get('role') == 'system']
+    others = [m for m in recent if not (isinstance(m, dict) and m.get('role') == 'system')]
+    chat_history = system_prompts + [new_summary_msg] + others
+    print('[记忆] 已压缩历史为摘要，保留最近 %d 轮' % _HISTORY_KEEP_RECENT)
 
 DEFAULT_APP_MAP = {
     # 系统工具
@@ -769,6 +1073,78 @@ def _sanitize_history():
     chat_history = clean
 
 
+def _stream_say(text_buffer):
+    """把累积的文本缓冲按句切分，遇到句末标点就入队播报一句。
+
+    切分优先级：句末标点（。！？等）→ 逗号（，、；：等）。逗号切出的片段
+    太短（< MIN_COMMA_LEN）时不播，留给后面的句号一起播，避免碎得太碎。
+    返回 True 表示本次切出了至少一句并送入 TTS 队列（用于标记"已流式播报"）。
+    调用方负责在生成结束后把 buffer 里剩下的尾巴再 flush 一次。
+    """
+    import re
+    # 句末标点：中文句号、叹号、问号、省略号；英文 . ! ?；以及换行
+    sentence_end = re.compile(r'[。！？!?.?…\n]')
+    # 逗号类：中文逗号、顿号、分号、冒号，用于句内进一步切分、降低首包延迟
+    comma_end = re.compile(r'[，、；：,]')
+    MIN_COMMA_LEN = 8  # 逗号切出的片段至少这么长才单独播，否则攒到句号
+    spoken = False
+    buf = text_buffer.get('buf', '')
+    pos = 0
+    pending = ''  # 逗号切分时攒着的"还没够长"的片段
+    while pos < len(buf):
+        m = sentence_end.search(buf, pos)
+        c = comma_end.search(buf, pos)
+        if m and (c is None or m.start() < c.start()):
+            # 先遇到句末标点：把 pending + 到句末的内容一起播
+            end = m.end()
+            seg = (pending + buf[pos:end]).strip()
+            pos = end
+            pending = ''
+            if seg:
+                try:
+                    from src.feedback import say
+                except ImportError:
+                    from feedback import say
+                say(seg)
+                spoken = True
+        elif c is not None:
+            # 先遇到逗号：切出片段，够长就播、不够就攒进 pending
+            end = c.end()
+            frag = (pending + buf[pos:end]).strip()
+            pos = end
+            if len(frag) >= MIN_COMMA_LEN:
+                try:
+                    from src.feedback import say
+                except ImportError:
+                    from feedback import say
+                say(frag)
+                spoken = True
+                pending = ''
+            else:
+                pending = frag
+        else:
+            break
+    # 没遇到标点的剩余部分留在 buffer（可能还在 pending 或 buf 尾部）
+    if pending:
+        text_buffer['buf'] = pending + buf[pos:]
+    else:
+        text_buffer['buf'] = buf[pos:]
+    return spoken
+
+
+def _flush_stream(text_buffer):
+    """生成结束后把缓冲里残留的尾巴播报出去（不足一句的内容也念）"""
+    tail = (text_buffer.get('buf') or '').strip()
+    if tail:
+        try:
+            from src.feedback import say
+        except ImportError:
+            from feedback import say
+        say(tail)
+        return True
+    return False
+
+
 def _run_ai_agent(user_input):
     """AI agent：通过 function calling 让模型自主调用工具"""
     load_chat_history()
@@ -784,43 +1160,62 @@ def _run_ai_agent(user_input):
 
 
 def _agent_loop():
-    """agent 主循环：模型调用工具 -> 执行 -> 反馈，直到得到最终回复"""
+    """agent 主循环：模型调用工具 -> 执行 -> 反馈，直到得到最终回复。
+    最终回复一轮使用流式输出，边生成边按句播报（降低首包延迟）。
+    """
     global chat_history
     from .stop import STOP_REQUESTED
     reply = ''
+    streamed = False  # 是否已通过流式按句播报（用于通知上层跳过整段 TTS）
+    text_buffer = {'buf': ''}
     for _ in range(6):  # 最多 6 轮工具调用
         if STOP_REQUESTED.is_set():
             reply = '（已停止）'
             break
 
+        # 仅最后一轮（无工具调用、有正文）才走流式播报；中间轮工具调用不播
         response = ollama.chat(
             model=get_ollama_model(),
             messages=chat_history,
             tools=TOOLS,
+            stream=True,
         )
-        message = response['message']
-        # 新版 ollama 库返回 pydantic 对象（Message/ToolCall），
-        # 必须转成纯 dict，否则后续 JSON 序列化会报
-        # "Object of type ToolCall is not JSON serializable"
-        if hasattr(message, 'model_dump'):
-            message = message.model_dump(exclude_none=True)
-        elif not isinstance(message, dict):
-            message = dict(message)
-        tool_calls = _to_plain(message.get('tool_calls') or [])
+        message = None
+        content_parts = []
+        tool_calls_raw = None
+        for chunk in response:
+            msg = chunk.get('message', {})
+            piece = msg.get('content', '') or ''
+            if piece:
+                content_parts.append(piece)
+                text_buffer['buf'] += piece
+                if _stream_say(text_buffer):
+                    streamed = True
+            # 工具调用通常在最后一个 chunk 的 message 上以对象形式给出
+            tc = msg.get('tool_calls')
+            if tc:
+                tool_calls_raw = tc
+
+        raw_content = ''.join(content_parts).strip()
+        # 归一化 tool_calls（可能是 pydantic 对象）
+        tool_calls = _to_plain(tool_calls_raw or [])
 
         if not tool_calls:
-            reply = (message.get('content') or '').strip() or '（无回复）'
+            reply = raw_content or '（无回复）'
             chat_history.append({'role': 'assistant', 'content': reply})
             break
 
-        # 记录 assistant 的工具调用消息
+        # 记录 assistant 的工具调用消息（用归一化后的纯 dict）
         chat_history.append({
             'role': 'assistant',
-            'content': message.get('content') or '',
+            'content': raw_content,
             'tool_calls': tool_calls,
         })
 
         # 执行工具并把结果反馈给模型
+        # 失败保护：同一工具连续失败达到上限就放弃，避免模型反复调同一个坏工具导致死循环
+        MAX_TOOL_FAILS = 3
+        fail_streak = 0
         for tc in tool_calls:
             fn = tc.get('function', {}) if isinstance(tc, dict) else {}
             name = fn.get('name', '')
@@ -832,23 +1227,51 @@ def _agent_loop():
                 except Exception:
                     args = {}
             ok, result = _execute_tool(name, args)
+            if not ok:
+                fail_streak += 1
+                print(f'[Tool] {name} 执行失败（连续第 {fail_streak} 次）')
+                if fail_streak >= MAX_TOOL_FAILS:
+                    print(f'[Tool] {name} 连续失败 {MAX_TOOL_FAILS} 次，放弃本轮工具调用')
+                    chat_history.append({
+                        'role': 'tool',
+                        'tool_name': name or 'unknown',
+                        'content': f'工具 {name} 连续失败 {MAX_TOOL_FAILS} 次，已停止重试。请直接回答或换其他方式。',
+                    })
+                    # 跳出不成功的工具，直接进入下一轮让模型决定收尾
+                    break
+            else:
+                fail_streak = 0
             # tool 消息需要带 tool_name（新版 ollama 库的格式要求）
             chat_history.append({'role': 'tool', 'tool_name': name or 'unknown', 'content': str(result)})
+        # 工具调用轮结束后，清空缓冲，避免把中间轮碎片当作正文播报
+        text_buffer['buf'] = ''
 
     if not reply:
         reply = '（未获得回复）'
 
-    if len(chat_history) > 30:
-        chat_history = chat_history[-30:]
+    # 生成结束，把剩余缓冲 flush 成最后一句播报
+    if _flush_stream(text_buffer):
+        streamed = True
+
+    # 每轮轻量抽取长期事实（GPT 式长期记忆），失败不影响对话
+    try:
+        _update_long_term_memory(chat_history)
+    except Exception as e:
+        print(f'[长期记忆] 抽取调用异常（已忽略）: {e}')
+
+    # 历史过长时压缩为摘要（增量），避免暴力截断丢失人设与长期记忆
+    compact_history()
     save_chat_history()
-    return True, reply
+    return True, reply, streamed
 
 
 def _stream_chat():
-    """普通流式聊天（agent 回退，支持中途停止）"""
+    """普通流式聊天（agent 回退，支持中途停止），边生成边按句播报"""
     global chat_history
     from .stop import STOP_REQUESTED
     full_reply = ''
+    text_buffer = {'buf': ''}
+    streamed = False
     for chunk in ollama.chat(
         model=get_ollama_model(),
         messages=chat_history,
@@ -856,15 +1279,20 @@ def _stream_chat():
     ):
         piece = chunk.get('message', {}).get('content', '') or ''
         full_reply += piece
+        text_buffer['buf'] += piece
+        if _stream_say(text_buffer):
+            streamed = True
         if STOP_REQUESTED.is_set():
             full_reply = full_reply.strip() + '\n（已停止）'
             break
     reply = full_reply.strip() or '（无回复）'
+    if _flush_stream(text_buffer):
+        streamed = True
     chat_history.append({'role': 'assistant', 'content': reply})
     if len(chat_history) > 20:
         chat_history = chat_history[-20:]
     save_chat_history()
-    return True, reply
+    return True, reply, streamed
 
 
 def web_search(query):
@@ -941,6 +1369,14 @@ def execute_intent(intent_name, slots, raw_text=''):
 
     if intent_name == 'get_date':
         return get_date()
+
+    if intent_name == 'remember':
+        content = (slots.get('content') or raw_text or '').strip()
+        return _handle_remember(content)
+
+    if intent_name == 'forget':
+        content = (slots.get('content') or raw_text or '').strip()
+        return _handle_forget(content)
 
     # 系统控制（支持确认机制）
     from .config import load_config

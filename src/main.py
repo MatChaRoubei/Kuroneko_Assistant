@@ -47,7 +47,7 @@ from src.cleaner import (
 from src.config import load_config
 from src.executor import execute_intent, configure_ollama
 from src.feedback import say, notify, configure_tts, warmup_tts, say_sync, wait_speaking_done, say_wake
-from src.stop import begin_output, end_output, start_stop_listener, request_stop, is_stop_requested
+from src.stop import begin_output, end_output, start_stop_listener, start_barge_in_listener, request_stop, is_stop_requested
 from src.intents import IntentParser
 from src.logger import configure_logging, get_logger
 from src.plugins import PluginManager
@@ -55,7 +55,11 @@ from src.recognize import SpeechRecognizer, SherpaONNXRecognizer, check_speech_d
 from src.nlu.phonetic_corrector import PhoneticCorrector
 from src.nlu.fuzzy_regex import FuzzyRegexMatcher
 from src.tray import start_tray
-from src.gui import load_selected_model, append_asr, append_output, set_status, start_main_window, load_settings, get_wake_words, get_tts_engine, get_tts_voice, get_sensitivity, get_stop_words
+from src.gui import load_selected_model, append_asr, append_output, set_status, start_main_window, load_settings, get_wake_words, get_tts_engine, get_tts_voice, get_sensitivity, get_stop_words, get_tts_style, get_tts_rate, get_tts_pitch
+
+# 打断（barge-in）总开关：播放/生成期间主人开口即中断当前播报。
+# 设为 False 可关闭（仅保留停止词中断）。后续可接入 settings.json 由 GUI 控制。
+BARGE_IN_ENABLED = True
 
 
 def create_recognizer(cfg):
@@ -111,8 +115,9 @@ def main():
     print("Config loaded")
     # 读取用户设置（唤醒词、灵敏度、TTS 引擎）
     load_settings()
-    # 配置 TTS 引擎
-    configure_tts(get_tts_engine(), get_tts_voice())
+    # 配置 TTS 引擎（含感情风格/语速/音调，均来自 GUI 设置）
+    configure_tts(get_tts_engine(), get_tts_voice(),
+                  get_tts_style(), get_tts_rate(), get_tts_pitch())
     warmup_tts()
     configure_ollama(load_selected_model() or cfg.get('ollama_model'))
     configure_logging(cfg.get('log_file'))
@@ -331,12 +336,27 @@ def main():
 
             if intent_name == 'unknown':
                 # AI 生成：启动停止监听（语音说出停止词或按 Esc 键停止）
+                # 监听覆盖"生成 + 播报"整个阶段，实现播放中可打断（barge-in）
                 begin_output()
                 start_stop_listener(use_voice, recognizer, get_stop_words())
-                success, message = execute_intent(intent_name, slots, query)
+                if BARGE_IN_ENABLED:
+                    start_barge_in_listener(recognizer)
+                result = execute_intent(intent_name, slots, query)
+                # 等 TTS 队列播报完再结束输出，确保播放期间停止词/开口打断始终有效
+                try:
+                    from src.feedback import wait_speaking_done
+                    wait_speaking_done()
+                except Exception:
+                    pass
                 end_output()
             else:
-                success, message = execute_intent(intent_name, slots, query)
+                result = execute_intent(intent_name, slots, query)
+            # 兼容返回格式：(success, message) 或 (success, message, streamed)
+            if len(result) == 3:
+                success, message, streamed = result
+            else:
+                success, message = result
+                streamed = False
             if not success:
                 logger.warning(message)
                 append_output('执行失败：' + message)
@@ -344,7 +364,9 @@ def main():
             else:
                 logger.info(message)
                 append_output(message)
-                say(message)
+                # 若 executor 已流式按句播报过，则不再整段念一遍，避免重复
+                if not streamed:
+                    say(message)
             notify('语音助手', message)
             set_status('● 监听中，说「你好黑猫」唤醒')
 
@@ -356,4 +378,14 @@ def main():
             say('发生错误:' + str(e))
 
 if __name__ == '__main__':
+    if '--debug' in sys.argv:
+        # 诊断模式：运行独立诊断工具并退出，不启动语音助手
+        try:
+            from src.debug_tool import run_diagnostics
+            run_diagnostics(cli=True)
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            print('[诊断] 运行失败:', exc)
+        sys.exit(0)
     main()

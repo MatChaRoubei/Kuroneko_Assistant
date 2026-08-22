@@ -68,6 +68,7 @@ a = Analysis(
         'lxml.html',
         'primp',
         'fake_useragent',
+        'src.debug_tool',
         # ===== 下面这些是 Python 标准库，需要显式声明 =====
         'wave',
         'audioop',

@@ -273,6 +273,9 @@ _runtime = {
     'sensitivity': 0.8,
     'tts_engine': 'vits',
     'tts_voice': 'zh-CN-XiaoxiaoNeural',
+    'tts_style': 'calm',
+    'tts_rate': '-12%',
+    'tts_pitch': '-6%',
     'stop_words': ['停止', '停下', '闭嘴', '别说了', '打住'],
 }
 
@@ -312,6 +315,12 @@ def load_settings():
                 _runtime['tts_engine'] = data['tts_engine']
             if 'tts_voice' in data and data['tts_voice']:
                 _runtime['tts_voice'] = data['tts_voice']
+            if 'tts_style' in data and data['tts_style']:
+                _runtime['tts_style'] = data['tts_style']
+            if 'tts_rate' in data and data['tts_rate']:
+                _runtime['tts_rate'] = data['tts_rate']
+            if 'tts_pitch' in data and data['tts_pitch']:
+                _runtime['tts_pitch'] = data['tts_pitch']
             if 'stop_words' in data:
                 sw = data['stop_words']
                 if isinstance(sw, str):
@@ -322,7 +331,8 @@ def load_settings():
         pass
 
 
-def save_settings(wake_words, sensitivity, tts_engine, tts_voice=None):
+def save_settings(wake_words, sensitivity, tts_engine, tts_voice=None,
+                  tts_style='calm', tts_rate='-12%', tts_pitch='-6%'):
     """保存设置并更新运行时"""
     global _runtime
     _runtime['wake_words'] = wake_words
@@ -330,6 +340,9 @@ def save_settings(wake_words, sensitivity, tts_engine, tts_voice=None):
     _runtime['tts_engine'] = tts_engine
     if tts_voice:
         _runtime['tts_voice'] = tts_voice
+    _runtime['tts_style'] = tts_style
+    _runtime['tts_rate'] = tts_rate
+    _runtime['tts_pitch'] = tts_pitch
     try:
         with open(get_settings_file(), 'w', encoding='utf-8') as f:
             json.dump(_runtime, f, ensure_ascii=False, indent=2)
@@ -356,6 +369,18 @@ def get_tts_engine():
 
 def get_tts_voice():
     return _runtime.get('tts_voice', 'zh-CN-XiaoxiaoNeural')
+
+
+def get_tts_style():
+    return _runtime.get('tts_style', 'calm')
+
+
+def get_tts_rate():
+    return _runtime.get('tts_rate', '-12%')
+
+
+def get_tts_pitch():
+    return _runtime.get('tts_pitch', '-6%')
 
 
 def show_settings():
@@ -408,6 +433,40 @@ def show_settings():
                     break
             voice_combo.set(cur_voice_name)
 
+            # ---- Edge 感情风格 / 语速 / 音调（GUI 可调） ----
+            from src.feedback import EDGE_STYLE_OPTIONS
+            f3c = tk.Frame(root, bg='#f5f7fa')
+            f3c.pack(fill='x', padx=32, pady=6)
+            tk.Label(f3c, text='感情风格（edge 引擎时生效）', bg='#f5f7fa').pack(anchor='w')
+            style_combo = ttk.Combobox(f3c, values=list(EDGE_STYLE_OPTIONS.keys()), state='readonly')
+            style_combo.pack(fill='x')
+            cur_style = _runtime.get('tts_style', 'calm')
+            cur_style_name = '平静慵懒 (calm)'
+            for name, sid in EDGE_STYLE_OPTIONS.items():
+                if sid == cur_style:
+                    cur_style_name = name
+                    break
+            style_combo.set(cur_style_name)
+
+            f3d = tk.Frame(root, bg='#f5f7fa')
+            f3d.pack(fill='x', padx=32, pady=6)
+            tk.Label(f3d, text='语速（edge 引擎时生效，负=慢，正=快）', bg='#f5f7fa').pack(anchor='w')
+            rate_combo = ttk.Combobox(f3d, state='readonly', values=[
+                '-20%', '-15%', '-12%', '-8%', '-5%', '0%', '+5%', '+10%', '+15%', '+20%'
+            ])
+            rate_combo.pack(fill='x')
+            rate_combo.set(_runtime.get('tts_rate', '-12%'))
+
+            f3e = tk.Frame(root, bg='#f5f7fa')
+            f3e.pack(fill='x', padx=32, pady=6)
+            tk.Label(f3e, text='音调（edge 引擎时生效，负=低，正=高）', bg='#f5f7fa').pack(anchor='w')
+            pitch_combo = ttk.Combobox(f3e, state='readonly', values=[
+                '-20%', '-15%', '-10%', '-6%', '-3%', '0%', '+3%', '+6%', '+10%', '+15%', '+20%'
+            ])
+            pitch_combo.pack(fill='x')
+            pitch_combo.set(_runtime.get('tts_pitch', '-6%'))
+
+
             f4 = tk.Frame(root, bg='#f5f7fa')
             f4.pack(fill='x', padx=32, pady=6)
             tk.Label(f4, text='大模型（Ollama）', bg='#f5f7fa').pack(anchor='w')
@@ -442,13 +501,17 @@ def show_settings():
                 tts = tts_combo.get() or 'vits'
                 voice_name = voice_combo.get()
                 voice = VOICE_OPTIONS.get(voice_name, 'zh-CN-XiaoxiaoNeural')
+                style_name = style_combo.get()
+                style = EDGE_STYLE_OPTIONS.get(style_name, 'calm')
+                rate = rate_combo.get() or '-12%'
+                pitch = pitch_combo.get() or '-6%'
                 model = model_combo.get()
-                save_settings(ww, sens, tts, voice)
+                save_settings(ww, sens, tts, voice, style, rate, pitch)
                 if model:
                     save_selected_model(model)
                 try:
                     from src.feedback import configure_tts
-                    configure_tts(tts, voice)
+                    configure_tts(tts, voice, style, rate, pitch)
                 except Exception:
                     pass
                 try:

@@ -6,8 +6,11 @@
 
 预编译的单文件版本（含全部模型依赖，开箱即用）：
 
-- **v0.0.3（当前版本）**：[VoiceAssistant.exe（约 455 MB，实际 477 MB）](https://github.com/MatChaRoubei/Kuroneko_Assistant/releases/download/v0.0.3/VoiceAssistant.exe)
-  - 发布页（含变更说明）：<https://github.com/MatChaRoubei/Kuroneko_Assistant/releases/tag/v0.0.3>
+- **v0.0.4（当前版本）**：[VoiceAssistant.exe（约 477 MB）](https://github.com/MatChaRoubei/Kuroneko_Assistant/releases/download/v0.0.4/VoiceAssistant.exe)
+  - 发布页（含变更说明）：<https://github.com/MatChaRoubei/Kuroneko_Assistant/releases/tag/v0.0.4>
+  - 详见文末「v0.0.4」章节。
+- **v0.0.3**：[VoiceAssistant.exe（约 477 MB）](https://github.com/MatChaRoubei/Kuroneko_Assistant/releases/download/v0.0.3/VoiceAssistant.exe)
+  - 发布页：<https://github.com/MatChaRoubei/Kuroneko_Assistant/releases/tag/v0.0.3>
   - 唤醒词稳健性修复 + 新增「停止词」，详见文末「v0.0.3」章节。
 - **v0.0.2 性能优化与重构版**：[VoiceAssistant.exe（约 455 MB）](https://github.com/MatChaRoubei/Kuroneko_Assistant/releases/download/v0.0.2/VoiceAssistant.exe)
   - 发布页（含变更说明）：<https://github.com/MatChaRoubei/Kuroneko_Assistant/releases/tag/v0.0.2>
@@ -333,7 +336,17 @@ pyinstaller VoiceAssistant.spec
 
 ## 开发历程
 
-### v0.0.3（当前版本）
+### v0.0.4（当前版本）
+- **联网搜索后端自定义 + 本地搜索代理**：Ollama 联网搜索后端可配置（config.json / 本地代理），不再强依赖 Google；新增本地搜索代理脚本，离线环境也能检索。
+- **工具调用模型适配**：拉取并切换支持工具调用（tool_calls）的模型，修复大参数模型 ToolCall 无法 JSON 序列化导致的 500 错误；测试现有模型联网搜索能力。
+- **开机自启全自动搜索**：支持开机自启并后台自动执行搜索任务。
+- **executor 流式按句播报**：AI 回答改为边生成边按句播报，首字延迟更低；main.py 避免对同一条内容重复整段播报。
+- **TTS 语音满意度优化**：评估 TTS 自然度并给出方案；新增句内切分 + 工具失败保护；调整 TTS 离线策略（断网优先机械音 / SAPI，VITS 仅作最后兜底）。
+- **打断（barge-in）**：播放 / 生成期间主人开口即中断当前播报，无需说停止词。
+- **记忆系统升级**：记忆摘要化压缩长程历史；新增长期记忆库（每轮轻量抽取事实并注入）；支持显式「记住 / 忘记」意图。
+- **诊断工具**：新增 `src/debug_tool.py`，可从托盘「🔧 运行诊断」或 `VoiceAssistant.exe --debug` 运行，一键排查依赖 / 配置 / 模型 / 音频 / Ollama / TTS / 意图解析 / 模块导入。
+
+### v0.0.3
 - **唤醒词稳健性修复**：
   - 识别匹配从「字符级模糊」升级为「拼音级匹配」，彻底解决同音字误判——「黑猫」与「黑毛」、「助手」与「朱手」拼音相同即等价，两字唤醒词（尤其「黑猫」）不再不稳定。
   - KWS 模型原生词表不含自定义短唤醒词时自动回退到 STT + 拼音匹配（而非强行用 KWS 永远检测不到），对短词更稳。

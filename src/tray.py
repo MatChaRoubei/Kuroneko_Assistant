@@ -69,6 +69,20 @@ def _on_show_window(icon, item):
         print(f'[托盘] 显示窗口失败: {e}')
 
 
+def _on_diagnose(icon, item):
+    """托盘菜单「运行诊断」：后台启动诊断进程（--debug），报告写入 exe 旁 debug_report.txt 并打开"""
+    try:
+        import subprocess
+        if getattr(sys, 'frozen', False):
+            cmd = [sys.executable, '--debug']
+        else:
+            main_py = os.path.join(_get_resource_root(), 'src', 'main.py')
+            cmd = [sys.executable, main_py, '--debug']
+        subprocess.Popen(cmd, creationflags=0x08000000)  # CREATE_NO_WINDOW
+    except Exception as e:
+        print(f'[托盘] 启动诊断失败: {e}')
+
+
 def start_tray():
     """启动托盘图标（后台线程），返回 icon 对象或 None"""
     global _icon
@@ -84,6 +98,7 @@ def start_tray():
             pystray.MenuItem('显示窗口', _on_show_window, default=True),  # 左键单击唤起
             pystray.MenuItem('模型设置', _on_model_settings),
             pystray.MenuItem('说「你好黑猫」唤醒', _on_show),
+            pystray.MenuItem('🔧 运行诊断', _on_diagnose),
             pystray.MenuItem('退出', _on_exit),
         )
         _icon = pystray.Icon('voice_assistant', image, '黑猫语音助手', menu)
