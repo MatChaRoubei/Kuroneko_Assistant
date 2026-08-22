@@ -18,20 +18,44 @@ def _setup_import_paths():
 _setup_import_paths()
 
 
-# 判断是否为 windowed（无控制台）模式：需在重定向前判断
-IS_WINDOWED = getattr(sys, 'frozen', False) and (sys.stdout is None or sys.stderr is None)
+# 打包运行（frozen）时，无论 PyInstaller 是否把 stdout/stderr 置空，
+# 都无条件把标准输出重定向到 console.log。
+# 原因：speech_recognition 等第三方库在 import 时会 print 版本 banner，
+# 若依赖 `sys.stdout is None` 判断则会漏掉「带控制台窗口的打包」场景，
+# 导致用户一进 exe 就看到一堆打印。统一重定向可彻底消除控制台噪音。
+IS_WINDOWED = getattr(sys, 'frozen', False)
 
 if IS_WINDOWED:
-    # windowed 模式下把 print 重定向到日志，避免崩溃
     _log_path = os.path.join(
         os.path.dirname(os.path.abspath(sys.executable)), 'console.log'
     )
     try:
-        _log_f = open(_log_path, 'a', encoding='utf-8', buffering=1)
-        if sys.stdout is None:
-            sys.stdout = _log_f
-        if sys.stderr is None:
-            sys.stderr = _log_f
+        # 用 'w' 截断而非 'a' 追加：避免反复启动无限累积（旧版曾涨到数百 MB）
+        _log_f = open(_log_path, 'w', encoding='utf-8', buffering=1)
+        # 用 tee 包装：既吞掉控制台输出，又写入日志文件，方便排障
+        _orig_stdout = sys.stdout
+        _orig_stderr = sys.stderr
+
+        class _Tee:
+            def __init__(self, orig, logf):
+                self._orig = orig
+                self._logf = logf
+
+            def write(self, s):
+                try:
+                    self._logf.write(s)
+                except Exception:
+                    pass
+                return len(s)
+
+            def flush(self):
+                try:
+                    self._logf.flush()
+                except Exception:
+                    pass
+
+        sys.stdout = _Tee(_orig_stdout, _log_f)
+        sys.stderr = _Tee(_orig_stderr, _log_f)
     except Exception:
         pass
 
@@ -110,9 +134,7 @@ def create_recognizer(cfg):
 def main():
     cleanup_temp_files()
     start_periodic_cleanup()
-    print("Starting main...")
     cfg = load_config()
-    print("Config loaded")
     # 读取用户设置（唤醒词、灵敏度、TTS 引擎）
     load_settings()
     # 配置 TTS 引擎（含感情风格/语速/音调，均来自 GUI 设置）
@@ -122,7 +144,6 @@ def main():
     configure_ollama(load_selected_model() or cfg.get('ollama_model'))
     configure_logging(cfg.get('log_file'))
     logger = get_logger()
-    print("Logging configured")
 
     parser = IntentParser(cfg.get('intents_path'))
     plugin_manager = PluginManager(cfg.get('plugin_path'))
@@ -186,17 +207,14 @@ def main():
         logger.warning('语音识别不可用: ' + dep_msg)
 
     logger.info('语音助手启动完成')
-    print('语音模块检测:', dep_msg)
 
     # 启动时直接初始化语音识别器
     if voice_available:
         try:
             recognizer = create_recognizer(cfg)
             logger.info('语音识别模块初始化成功')
-            print('语音识别初始化成功')
         except Exception as e:
             logger.warning(f'语音识别初始化失败: {e}')
-            print(f'语音识别初始化失败，回退到 Google STT')
             try:
                 from src.recognize import SpeechRecognizer
                 recognizer = SpeechRecognizer(language=cfg.get('language', 'zh-CN'))
@@ -206,8 +224,7 @@ def main():
                 recognizer = None
 
     # 直接进入语音模式
-    print('欢迎使用 Windows 交互语音助手（输入”退出”结束）')
-    print('>>> 语音模式已启用 <<<')
+    logger.info('已进入语音模式')
     use_voice = True
 
     # 启动系统托盘图标（显示运行状态，右键可退出）
@@ -259,7 +276,7 @@ def main():
                     if not ok:
                         logger.warning(f'语音识别失败: {query}')
                         continue
-                print('识别内容：', query)
+                logger.info('识别内容：%s', query)
                 append_asr(query)
             else:
                 if IS_WINDOWED:

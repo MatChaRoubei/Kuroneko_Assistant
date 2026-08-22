@@ -384,7 +384,7 @@ def get_tts_pitch():
 
 
 def show_settings():
-    """设置窗口：唤醒词、灵敏度、TTS 引擎、模型"""
+    """设置窗口：唤醒词、灵敏度、TTS 引擎、模型（内容超出时支持上下滚动）"""
     def _build():
         try:
             import tkinter as tk
@@ -392,36 +392,57 @@ def show_settings():
 
             root = tk.Tk()
             root.title('设置')
-            root.geometry('460x460')
-            root.resizable(False, False)
+            root.geometry('520x560')
+            root.resizable(True, True)
+            root.minsize(420, 360)
             root.attributes('-topmost', True)
             root.configure(bg='#f5f7fa')
 
             tk.Label(root, text='设置', font=('Microsoft YaHei', 14, 'bold'), bg='#f5f7fa').pack(pady=(16, 8))
 
-            f1 = tk.Frame(root, bg='#f5f7fa')
-            f1.pack(fill='x', padx=32, pady=6)
+            # 滚动容器：内容较多时上下滚动，避免被窗口边界裁切
+            canvas = tk.Canvas(root, bg='#f5f7fa', highlightthickness=0)
+            scroll = tk.Scrollbar(root, orient='vertical', command=canvas.yview)
+            canvas.configure(yscrollcommand=scroll.set)
+            canvas.pack(side='left', fill='both', expand=True, padx=(16, 0))
+            scroll.pack(side='right', fill='y')
+
+            content = tk.Frame(canvas, bg='#f5f7fa')
+            canvas.create_window((0, 0), window=content, anchor='nw')
+
+            def _on_content_configure(event):
+                canvas.configure(scrollregion=canvas.bbox('all'))
+
+            content.bind('<Configure>', _on_content_configure)
+
+            def _on_mousewheel(event):
+                canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
+
+            canvas.bind_all('<MouseWheel>', _on_mousewheel)
+
+            f1 = tk.Frame(content, bg='#f5f7fa')
+            f1.pack(fill='x', padx=16, pady=6)
             tk.Label(f1, text='唤醒词（逗号分隔）', bg='#f5f7fa').pack(anchor='w')
             wake_entry = tk.Entry(f1, font=('Microsoft YaHei', 10))
             wake_entry.pack(fill='x', ipady=3)
             wake_entry.insert(0, '，'.join(_runtime['wake_words']))
 
-            f2 = tk.Frame(root, bg='#f5f7fa')
-            f2.pack(fill='x', padx=32, pady=6)
+            f2 = tk.Frame(content, bg='#f5f7fa')
+            f2.pack(fill='x', padx=16, pady=6)
             tk.Label(f2, text='唤醒灵敏度 (0.1~1.0，越低越宽松)', bg='#f5f7fa').pack(anchor='w')
             sens_entry = tk.Entry(f2, font=('Microsoft YaHei', 10))
             sens_entry.pack(fill='x', ipady=3)
             sens_entry.insert(0, str(_runtime['sensitivity']))
 
-            f3 = tk.Frame(root, bg='#f5f7fa')
-            f3.pack(fill='x', padx=32, pady=6)
+            f3 = tk.Frame(content, bg='#f5f7fa')
+            f3.pack(fill='x', padx=16, pady=6)
             tk.Label(f3, text='语音引擎（TTS）', bg='#f5f7fa').pack(anchor='w')
             tts_combo = ttk.Combobox(f3, values=['vits', 'edge', 'pyttsx3', 'auto'], state='readonly')
             tts_combo.pack(fill='x')
             tts_combo.set(_runtime.get('tts_engine', 'vits'))
 
-            f3b = tk.Frame(root, bg='#f5f7fa')
-            f3b.pack(fill='x', padx=32, pady=6)
+            f3b = tk.Frame(content, bg='#f5f7fa')
+            f3b.pack(fill='x', padx=16, pady=6)
             tk.Label(f3b, text='声音角色（edge 引擎时生效）', bg='#f5f7fa').pack(anchor='w')
             voice_combo = ttk.Combobox(f3b, values=list(VOICE_OPTIONS.keys()), state='readonly')
             voice_combo.pack(fill='x')
@@ -435,8 +456,8 @@ def show_settings():
 
             # ---- Edge 感情风格 / 语速 / 音调（GUI 可调） ----
             from src.feedback import EDGE_STYLE_OPTIONS
-            f3c = tk.Frame(root, bg='#f5f7fa')
-            f3c.pack(fill='x', padx=32, pady=6)
+            f3c = tk.Frame(content, bg='#f5f7fa')
+            f3c.pack(fill='x', padx=16, pady=6)
             tk.Label(f3c, text='感情风格（edge 引擎时生效）', bg='#f5f7fa').pack(anchor='w')
             style_combo = ttk.Combobox(f3c, values=list(EDGE_STYLE_OPTIONS.keys()), state='readonly')
             style_combo.pack(fill='x')
@@ -448,8 +469,8 @@ def show_settings():
                     break
             style_combo.set(cur_style_name)
 
-            f3d = tk.Frame(root, bg='#f5f7fa')
-            f3d.pack(fill='x', padx=32, pady=6)
+            f3d = tk.Frame(content, bg='#f5f7fa')
+            f3d.pack(fill='x', padx=16, pady=6)
             tk.Label(f3d, text='语速（edge 引擎时生效，负=慢，正=快）', bg='#f5f7fa').pack(anchor='w')
             rate_combo = ttk.Combobox(f3d, state='readonly', values=[
                 '-20%', '-15%', '-12%', '-8%', '-5%', '0%', '+5%', '+10%', '+15%', '+20%'
@@ -457,8 +478,8 @@ def show_settings():
             rate_combo.pack(fill='x')
             rate_combo.set(_runtime.get('tts_rate', '-12%'))
 
-            f3e = tk.Frame(root, bg='#f5f7fa')
-            f3e.pack(fill='x', padx=32, pady=6)
+            f3e = tk.Frame(content, bg='#f5f7fa')
+            f3e.pack(fill='x', padx=16, pady=6)
             tk.Label(f3e, text='音调（edge 引擎时生效，负=低，正=高）', bg='#f5f7fa').pack(anchor='w')
             pitch_combo = ttk.Combobox(f3e, state='readonly', values=[
                 '-20%', '-15%', '-10%', '-6%', '-3%', '0%', '+3%', '+6%', '+10%', '+15%', '+20%'
@@ -467,8 +488,8 @@ def show_settings():
             pitch_combo.set(_runtime.get('tts_pitch', '-6%'))
 
 
-            f4 = tk.Frame(root, bg='#f5f7fa')
-            f4.pack(fill='x', padx=32, pady=6)
+            f4 = tk.Frame(content, bg='#f5f7fa')
+            f4.pack(fill='x', padx=16, pady=6)
             tk.Label(f4, text='大模型（Ollama）', bg='#f5f7fa').pack(anchor='w')
             model_row = tk.Frame(f4, bg='#f5f7fa')
             model_row.pack(fill='x')
@@ -534,7 +555,7 @@ def show_settings():
                 else:
                     root.destroy()
 
-            tk.Button(root, text='保存并应用', command=save_and_close, bg='#4CAF50', fg='white',
+            tk.Button(content, text='保存并应用', command=save_and_close, bg='#4CAF50', fg='white',
                       font=('Microsoft YaHei', 11, 'bold'), width=16).pack(pady=14)
 
             root.protocol('WM_DELETE_WINDOW', on_close)
