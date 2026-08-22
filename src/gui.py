@@ -275,7 +275,7 @@ _runtime = {
     'tts_voice': 'zh-CN-XiaoxiaoNeural',
     'tts_style': 'calm',
     'tts_rate': '-5%',                        # 语速：轻微放慢更从容；过慢(-12%)会显人机
-    'tts_pitch': '0%',                        # 音调：保持基准；负降调会让女声发闷
+    'tts_pitch': '+0Hz',                      # 音调：edge_tts 用 Hz(+0Hz 中性)；非负百分比如 0% 会被拒
     'tts_azure_key': '',                     # Azure(微软)语音合成订阅密钥
     'tts_azure_region': 'chinaeast2',        # Azure 区域(需与订阅资源一致)
     'tts_azure_voice': 'zh-CN-XiaoxiaoNeural',  # Azure 神经语音音色
@@ -341,7 +341,7 @@ def load_settings():
 
 
 def save_settings(wake_words, sensitivity, tts_engine, tts_voice=None,
-                  tts_style='calm', tts_rate='-5%', tts_pitch='0%',
+                  tts_style='calm', tts_rate='-5%', tts_pitch='+0Hz',
                   tts_azure_key='', tts_azure_region='chinaeast2',
                   tts_azure_voice='zh-CN-XiaoxiaoNeural'):
     """保存设置并更新运行时"""
@@ -394,7 +394,7 @@ def get_tts_rate():
 
 
 def get_tts_pitch():
-    return _runtime.get('tts_pitch', '0%')
+    return _runtime.get('tts_pitch', '+0Hz')
 
 
 def get_tts_azure_key():
@@ -508,10 +508,10 @@ def show_settings():
             f3e.pack(fill='x', padx=16, pady=6)
             tk.Label(f3e, text='音调（edge/azure 在线引擎时生效，负=低，正=高）', bg='#f5f7fa').pack(anchor='w')
             pitch_combo = ttk.Combobox(f3e, state='readonly', values=[
-                '-20%', '-15%', '-10%', '-6%', '-3%', '0%', '+3%', '+6%', '+10%', '+15%', '+20%'
+                '-10Hz', '-6Hz', '-3Hz', '+0Hz', '+3Hz', '+6Hz', '+10Hz'
             ])
             pitch_combo.pack(fill='x')
-            pitch_combo.set(_runtime.get('tts_pitch', '0%'))
+            pitch_combo.set(_runtime.get('tts_pitch', '+0Hz'))
 
             # ---- Azure(微软)语音合成：国内 azure.cn 节点、音质高，需订阅密钥 ----
             f3f = tk.Frame(content, bg='#f5f7fa')
@@ -576,7 +576,7 @@ def show_settings():
                 style_name = style_combo.get()
                 style = EDGE_STYLE_OPTIONS.get(style_name, 'calm')
                 rate = rate_combo.get() or '-5%'
-                pitch = pitch_combo.get() or '0%'
+                pitch = pitch_combo.get() or '+0Hz'
                 model = model_combo.get()
                 azure_key = azure_key_entry.get().strip()
                 azure_region = azure_region_entry.get().strip() or 'chinaeast2'

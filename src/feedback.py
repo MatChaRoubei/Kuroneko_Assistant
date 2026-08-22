@@ -26,7 +26,7 @@ _AZURE_VOICE = 'zh-CN-XiaoxiaoNeural' # 控制台「语音合成」可查音色
 # 风格：映射到 Edge mstts:express-as 的 style 值
 _EDGE_STYLE = 'calm'      # affectionate / gentle / calm / chat / cheerful 等
 _EDGE_RATE = '-5%'        # 语速：轻微放慢更从容；过慢(-12%)会显人机、拖沓
-_EDGE_PITCH = '0%'        # 音调：保持基准；负降调会让女声发闷不自然
+_EDGE_PITCH = '+0Hz'      # 音调：edge_tts 用 Hz（如 +0Hz/-6Hz），中性基准（下方引擎区会再次定义，以那里为准）
 
 # 风格显示名 -> Edge style 值（供 GUI 下拉使用）
 EDGE_STYLE_OPTIONS = {
@@ -56,7 +56,7 @@ _tts_engine_ttl = 60  # 秒
 
 
 def configure_tts(engine='auto', voice='zh-CN-XiaoxiaoNeural',
-                  style='calm', rate='-5%', pitch='0%',
+                  style='calm', rate='-5%', pitch='+0Hz',
                   azure_key=None, azure_region=None, azure_voice=None):
     """设置 TTS 引擎偏好：auto / edge / vits / pyttsx3 / azure，
     以及在线神经语音(edge/azure)通用的感情风格/语速/音调。"""
@@ -154,7 +154,9 @@ def _play_mp3(path):
 # 感情风格与语调：平静慵懒的黑猫人设（calm 风格 + 略慢略低）
 _EDGE_STYLE = 'calm'      # affectionate / gentle / calm / chat 等
 _EDGE_RATE = '-5%'        # 语速：轻微放慢更从容；过慢(-12%)会显人机、拖沓
-_EDGE_PITCH = '0%'        # 音调：保持基准；负降调会让女声发闷不自然
+# 注意：edge_tts 7.x 的 pitch 仅接受带符号 Hz 格式(正则 ^[+-]\d+Hz$)，不接受百分比；
+# 0 为中性基准。_speak_with_edge 内也会把残留的百分比写法兜底换算成 Hz。
+_EDGE_PITCH = '+0Hz'      # 音调：edge_tts 用 Hz（如 +0Hz/-6Hz），中性基准
 
 
 def _speak_with_edge(text):
@@ -173,11 +175,20 @@ def _speak_with_edge(text):
             # 若传入 SSML 字符串，<speak ...> 标签会被逐字朗读（用户听到的
             # "speak version 1.0 / synthesis" 正是这个 bug）。因此必须传纯文本，
             # 并用 rate/pitch 参数控制语速与音调（edge_tts 不支持 express-as 风格）。
+            # edge_tts 7.x 的 pitch 仅接受带符号 Hz 格式(正则 ^[+-]\d+Hz$)，
+            # 不接受百分比；若配置仍是旧百分比写法(-6% / 0%)则兜底换算成 Hz，
+            # 避免整条引擎因格式错误直接失效（之前 "Invalid pitch '0%'" 就是这个原因）
+            pitch = _EDGE_PITCH
+            if isinstance(pitch, str) and pitch.endswith('%'):
+                try:
+                    pitch = f"{float(pitch.replace('%', '')):+.0f}Hz"
+                except Exception:
+                    pitch = '+0Hz'
             communicate = edge_tts.Communicate(
                 text,
                 voice=_edge_voice,
                 rate=_EDGE_RATE,
-                pitch=_EDGE_PITCH,
+                pitch=pitch,
                 # 国内连微软境外节点经常慢/不稳：连线 4s、接收 12s 超时，
                 # 超时即快速失败回退到本地引擎，避免答案已显示却迟迟不读
                 connect_timeout=4,
@@ -196,10 +207,15 @@ def _speak_with_edge(text):
 
 # ---------- 引擎1.5：Azure(微软)语音合成（国内 azure.cn 节点，在线，音质高） ----------
 def _norm_pct(value, default):
-    """把 '-12%' / '12' 这类写成 Azure prosody 友好的 '-12.00%'。"""
+    """把 '-12%' / '+0Hz' / '12' 这类写成 Azure prosody 友好的格式。
+    - 百分比：'-5%' -> '-5%'
+    - Hz：'+0Hz' -> '+0Hz'（edge_tts 7.x 用 Hz，Azure 同样支持 Hz 相对值）
+    """
+    s = str(value).strip()
     try:
-        num = float(str(value).replace('%', ''))
-        return f'{num:+.2f}%'
+        if s.endswith('Hz'):
+            return f'{float(s[:-2]):+.0f}Hz'
+        return f'{float(s.replace("%", "")):+.0f}%'
     except Exception:
         return default
 
