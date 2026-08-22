@@ -271,11 +271,11 @@ class MainWindow:
 _runtime = {
     'wake_words': ['你好黑猫', '助手', '黑猫', '你好助手'],
     'sensitivity': 0.8,
-    'tts_engine': 'vits',
+    'tts_engine': 'edge',                     # 默认 edge：微软免费在线神经语音，无需注册/卡号
     'tts_voice': 'zh-CN-XiaoxiaoNeural',
     'tts_style': 'calm',
-    'tts_rate': '-12%',
-    'tts_pitch': '-6%',
+    'tts_rate': '-5%',                        # 语速：轻微放慢更从容；过慢(-12%)会显人机
+    'tts_pitch': '0%',                        # 音调：保持基准；负降调会让女声发闷
     'tts_azure_key': '',                     # Azure(微软)语音合成订阅密钥
     'tts_azure_region': 'chinaeast2',        # Azure 区域(需与订阅资源一致)
     'tts_azure_voice': 'zh-CN-XiaoxiaoNeural',  # Azure 神经语音音色
@@ -341,7 +341,7 @@ def load_settings():
 
 
 def save_settings(wake_words, sensitivity, tts_engine, tts_voice=None,
-                  tts_style='calm', tts_rate='-12%', tts_pitch='-6%',
+                  tts_style='calm', tts_rate='-5%', tts_pitch='0%',
                   tts_azure_key='', tts_azure_region='chinaeast2',
                   tts_azure_voice='zh-CN-XiaoxiaoNeural'):
     """保存设置并更新运行时"""
@@ -390,11 +390,11 @@ def get_tts_style():
 
 
 def get_tts_rate():
-    return _runtime.get('tts_rate', '-12%')
+    return _runtime.get('tts_rate', '-5%')
 
 
 def get_tts_pitch():
-    return _runtime.get('tts_pitch', '-6%')
+    return _runtime.get('tts_pitch', '0%')
 
 
 def get_tts_azure_key():
@@ -465,7 +465,7 @@ def show_settings():
             tk.Label(f3, text='语音引擎（TTS）', bg='#f5f7fa').pack(anchor='w')
             tts_combo = ttk.Combobox(f3, values=['vits', 'edge', 'pyttsx3', 'azure', 'auto'], state='readonly')
             tts_combo.pack(fill='x')
-            tts_combo.set(_runtime.get('tts_engine', 'vits'))
+            tts_combo.set(_runtime.get('tts_engine', 'edge'))
 
             f3b = tk.Frame(content, bg='#f5f7fa')
             f3b.pack(fill='x', padx=16, pady=6)
@@ -502,7 +502,7 @@ def show_settings():
                 '-20%', '-15%', '-12%', '-8%', '-5%', '0%', '+5%', '+10%', '+15%', '+20%'
             ])
             rate_combo.pack(fill='x')
-            rate_combo.set(_runtime.get('tts_rate', '-12%'))
+            rate_combo.set(_runtime.get('tts_rate', '-5%'))
 
             f3e = tk.Frame(content, bg='#f5f7fa')
             f3e.pack(fill='x', padx=16, pady=6)
@@ -511,12 +511,12 @@ def show_settings():
                 '-20%', '-15%', '-10%', '-6%', '-3%', '0%', '+3%', '+6%', '+10%', '+15%', '+20%'
             ])
             pitch_combo.pack(fill='x')
-            pitch_combo.set(_runtime.get('tts_pitch', '-6%'))
+            pitch_combo.set(_runtime.get('tts_pitch', '0%'))
 
             # ---- Azure(微软)语音合成：国内 azure.cn 节点、音质高，需订阅密钥 ----
             f3f = tk.Frame(content, bg='#f5f7fa')
             f3f.pack(fill='x', padx=16, pady=6)
-            tk.Label(f3f, text='Azure 语音订阅密钥（引擎选「azure」或「auto」时填写，门户「密钥与终结点」获取）',
+            tk.Label(f3f, text='Azure 语音订阅密钥（可选：需信用卡注册 Azure 并开通「语音服务」；留空则用免费 edge 引擎）',
                      bg='#f5f7fa').pack(anchor='w')
             azure_key_entry = tk.Entry(f3f, font=('Microsoft YaHei', 10), show='*')
             azure_key_entry.pack(fill='x', ipady=3)
@@ -570,13 +570,13 @@ def show_settings():
                 except Exception:
                     messagebox.showwarning('提示', '灵敏度需为 0~1 之间的数字', parent=root)
                     return False
-                tts = tts_combo.get() or 'vits'
+                tts = tts_combo.get() or 'edge'
                 voice_name = voice_combo.get()
                 voice = VOICE_OPTIONS.get(voice_name, 'zh-CN-XiaoxiaoNeural')
                 style_name = style_combo.get()
                 style = EDGE_STYLE_OPTIONS.get(style_name, 'calm')
-                rate = rate_combo.get() or '-12%'
-                pitch = pitch_combo.get() or '-6%'
+                rate = rate_combo.get() or '-5%'
+                pitch = pitch_combo.get() or '0%'
                 model = model_combo.get()
                 azure_key = azure_key_entry.get().strip()
                 azure_region = azure_region_entry.get().strip() or 'chinaeast2'

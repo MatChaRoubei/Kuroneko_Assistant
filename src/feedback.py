@@ -10,19 +10,23 @@ _tts_lock = threading.Lock()
 _speaking = threading.Event()
 
 # 引擎偏好配置（由 main.py 启动时通过 configure_tts 设置）
-_engine_pref = 'auto'
+# 默认 edge：微软免费在线神经语音，无需注册/信用卡，开箱即用；
+# 只有用户显式选「azure」并在设置里填了订阅密钥时，才会启用 Azure（需信用卡注册）。
+_engine_pref = 'edge'
 _edge_voice = 'zh-CN-XiaoxiaoNeural'
 
-# Azure(微软)语音合成：国内走 azure.cn 节点、音质高、支持感情风格，作为优先在线引擎
-_AZURE_KEY = ''                       # 订阅密钥（Azure 门户「密钥与终结点」）
+# Azure(微软)语音合成：国内走 azure.cn 节点、音质高、支持感情风格，可选引擎。
+# 需在 Azure 门户开通「语音服务」并拿到订阅密钥与区域(如 chinaeast2)，即需要信用卡注册；
+# 无 Key 时不会启用，自动回落 edge。
+_AZURE_KEY = ''                       # 订阅密钥（Azure 门户「密钥与终结点」，可选）
 _AZURE_REGION = 'chinaeast2'          # 区域，需与订阅资源所在区域一致
 _AZURE_VOICE = 'zh-CN-XiaoxiaoNeural' # 控制台「语音合成」可查音色
 
 # 感情风格与语调（GUI 可调，configure_tts 设置）
 # 风格：映射到 Edge mstts:express-as 的 style 值
 _EDGE_STYLE = 'calm'      # affectionate / gentle / calm / chat / cheerful 等
-_EDGE_RATE = '-12%'       # 语速：相对基准的快慢，如 -20% ~ +20%
-_EDGE_PITCH = '-6%'       # 音调：相对基准的高低，如 -20% ~ +20%
+_EDGE_RATE = '-5%'        # 语速：轻微放慢更从容；过慢(-12%)会显人机、拖沓
+_EDGE_PITCH = '0%'        # 音调：保持基准；负降调会让女声发闷不自然
 
 # 风格显示名 -> Edge style 值（供 GUI 下拉使用）
 EDGE_STYLE_OPTIONS = {
@@ -408,9 +412,10 @@ def _current_order():
         return ['vits', 'edge', 'pyttsx3', 'sapi']
     if _engine_pref == 'pyttsx3':
         return ['pyttsx3', 'sapi']
-    # auto：Azure(国内、音质高、支持感情风格)优先；未配置 Key/区域时
-    # _speak_with_azure 会立即返回 False 并被缓存跳过，自动落到 edge；断网再掉本地机械音/气泡音
-    return ['azure', 'edge', 'pyttsx3', 'sapi', 'vits']
+    # auto：edge(微软免费在线神经语音，无需注册/信用卡)优先；
+    # 若用户显式选了「azure」且填了有效 Key，则会在前面优先用 Azure；
+    # 断网时回退本地机械音/气泡音兜底
+    return ['edge', 'azure', 'pyttsx3', 'sapi', 'vits']
 
 
 def _speak_cached(text):
