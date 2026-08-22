@@ -13,11 +13,10 @@ _speaking = threading.Event()
 _engine_pref = 'auto'
 _edge_voice = 'zh-CN-XiaoxiaoNeural'
 
-# 火山(字节)语音合成：国内节点、质量高，作为优先引擎
-_volc_api_key = ''
-_volc_voice = 'zh_female_qingxin'   # 控制台「音色库」可查，如 zh_female_qingxin
-_volc_speed = 1.0                    # 语速比例 0.5~2.0
-_volc_pitch = 1.0                    # 音调比例 0.5~2.0
+# Azure(微软)语音合成：国内走 azure.cn 节点、音质高、支持感情风格，作为优先在线引擎
+_AZURE_KEY = ''                       # 订阅密钥（Azure 门户「密钥与终结点」）
+_AZURE_REGION = 'chinaeast2'          # 区域，需与订阅资源所在区域一致
+_AZURE_VOICE = 'zh-CN-XiaoxiaoNeural' # 控制台「语音合成」可查音色
 
 # 感情风格与语调（GUI 可调，configure_tts 设置）
 # 风格：映射到 Edge mstts:express-as 的 style 值
@@ -54,10 +53,11 @@ _tts_engine_ttl = 60  # 秒
 
 def configure_tts(engine='auto', voice='zh-CN-XiaoxiaoNeural',
                   style='calm', rate='-5%', pitch='0%',
-                  api_key=None, api_voice=None, api_speed=None):
-    """设置 TTS 引擎偏好：auto / edge / vits / pyttsx3 / volcengine，以及 Edge 感情风格/语速/音调"""
+                  azure_key=None, azure_region=None, azure_voice=None):
+    """设置 TTS 引擎偏好：auto / edge / vits / pyttsx3 / azure，
+    以及在线神经语音(edge/azure)通用的感情风格/语速/音调。"""
     global _engine_pref, _edge_voice, _EDGE_STYLE, _EDGE_RATE, _EDGE_PITCH
-    global _volc_api_key, _volc_voice, _volc_speed, _volc_pitch
+    global _AZURE_KEY, _AZURE_REGION, _AZURE_VOICE
     if engine:
         _engine_pref = engine
     if voice:
@@ -68,15 +68,12 @@ def configure_tts(engine='auto', voice='zh-CN-XiaoxiaoNeural',
         _EDGE_RATE = rate
     if pitch:
         _EDGE_PITCH = pitch
-    if api_key is not None:
-        _volc_api_key = api_key
-    if api_voice:
-        _volc_voice = api_voice
-    if api_speed is not None:
-        try:
-            _volc_speed = float(api_speed)
-        except Exception:
-            pass
+    if azure_key is not None:
+        _AZURE_KEY = azure_key
+    if azure_region is not None:
+        _AZURE_REGION = azure_region
+    if azure_voice:
+        _AZURE_VOICE = azure_voice
 
 
 _wake_audio = None  # 预生成的唤醒反馈音频 (samples, sample_rate)
@@ -193,42 +190,66 @@ def _speak_with_edge(text):
             return False
 
 
-# ---------- 引擎1.5：火山(字节)语音合成（国内节点，在线，音质高） ----------
-def _speak_with_volcengine(text):
-    """火山语音合成：POST /api/v1/tts，Authorization: Bearer <API Key>，直接返回 mp3。
-    需先在火山控制台开通「语音合成」并创建 API Key 填入设置。"""
-    if not _volc_api_key:
+# ---------- 引擎1.5：Azure(微软)语音合成（国内 azure.cn 节点，在线，音质高） ----------
+def _norm_pct(value, default):
+    """把 '-12%' / '12' 这类写成 Azure prosody 友好的 '-12.00%'。"""
+    try:
+        num = float(str(value).replace('%', ''))
+        return f'{num:+.2f}%'
+    except Exception:
+        return default
+
+
+def _azure_ssml(text):
+    """生成 Azure 神经语音 SSML：支持 mstts:express-as 感情风格 + prosody 语速/音调。
+    （edge_tts 会把输入当纯文本 escape，无法用 SSML；Azure REST 接口原生支持，故可恢复感情风格）"""
+    import xml.sax.saxutils as su
+    safe = su.escape(text)
+    rate = _norm_pct(_EDGE_RATE, '+0.00%')
+    pitch = _norm_pct(_EDGE_PITCH, '+0.00%')
+    if _EDGE_STYLE and _EDGE_STYLE != 'none':
+        inner = (f'<mstts:express-as style="{_EDGE_STYLE}">'
+                 f'<prosody rate="{rate}" pitch="{pitch}">{safe}</prosody>'
+                 '</mstts:express-as>')
+    else:
+        inner = f'<prosody rate="{rate}" pitch="{pitch}">{safe}</prosody>'
+    return ('<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" '
+            'xmlns:mstts="https://www.w3.org/2001/mstts" xml:lang="zh-CN">'
+            f'<voice name="{_AZURE_VOICE}">{inner}</voice></speak>')
+
+
+def _speak_with_azure(text):
+    """Azure 语音合成：POST {region}.tts.speech.azure.cn/cognitiveservices/v1，
+    Ocp-Apim-Subscription-Key 鉴权，SSML 请求体，直接返回 mp3。
+    需先在 Azure 门户开通「语音服务」并拿到订阅密钥与区域(如 chinaeast2)。"""
+    if not _AZURE_KEY or not _AZURE_REGION:
         return False
-    import json
     import urllib.request
     import urllib.error
-    url = 'https://openspeech.bytedance.com/api/v1/tts'
-    body = {
-        'text': text,
-        'voice_type': _volc_voice or 'zh_female_qingxin',
-        'format': 'mp3',
-        'speed': _volc_speed,
-        'pitch': _volc_pitch,
-    }
-    data = json.dumps(body).encode('utf-8')
-    req = urllib.request.Request(
-        url, data=data,
-        headers={
-            'Authorization': f'Bearer {_volc_api_key}',
-            'Content-Type': 'application/json',
-        },
-        method='POST',
-    )
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            ctype = resp.headers.get('Content-Type', '')
+        from src.cleaner import register_active_file, unregister_active_file
+    except ImportError:
+        register_active_file = unregister_active_file = None
+    ssml = _azure_ssml(text)
+    url = f'https://{_AZURE_REGION}.tts.speech.azure.cn/cognitiveservices/v1'
+    req = urllib.request.Request(url, data=ssml.encode('utf-8'), method='POST')
+    req.add_header('Ocp-Apim-Subscription-Key', _AZURE_KEY)
+    req.add_header('Content-Type', 'application/ssml+xml')
+    req.add_header('X-Microsoft-OutputFormat', 'audio-16khz-128kbitrate-mono-mp3')
+    req.add_header('User-Agent', 'KuronekoAssistant')
+    mp3_path = os.path.join(_get_tmp_dir(), 'assistant_tts.mp3')
+    if register_active_file:
+        register_active_file(mp3_path)  # 标记正在使用，清理时跳过
+    try:
+        import ssl
+        ctx = ssl.create_default_context()
+        with urllib.request.urlopen(req, timeout=12, context=ctx) as resp:
             audio = resp.read()
-        # 鉴权/参数错误时返回 JSON 而非音频，首字节为 '{'
-        if not audio or (audio[:1] == b'{' and 'audio' not in ctype):
-            print(f'[TTS] volcengine 返回非音频(可能鉴权失败): '
+        # 鉴权/参数错误时返回 XML/JSON 而非音频，首字节为 '<'
+        if not audio or audio[:1] == b'<':
+            print(f'[TTS] azure 返回非音频(可能密钥/区域错误): '
                   f'{audio[:200].decode("utf-8", "ignore")}')
             return False
-        mp3_path = os.path.join(_get_tmp_dir(), 'assistant_tts.mp3')
         with open(mp3_path, 'wb') as f:
             f.write(audio)
         _play_mp3(mp3_path)
@@ -236,14 +257,17 @@ def _speak_with_volcengine(text):
     except urllib.error.HTTPError as e:
         detail = ''
         try:
-            detail = e.read().decode('utf-8', 'ignore')[:200]
+            detail = e.read().decode('utf-8', 'ignore')[:300]
         except Exception:
             pass
-        print(f'[TTS] volcengine HTTP 错误 {e.code}: {detail}')
+        print(f'[TTS] azure HTTP 错误 {e.code}: {detail}')
         return False
     except Exception as e:
-        print(f'[TTS] volcengine 失败: {e}')
+        print(f'[TTS] azure 失败: {e}')
         return False
+    finally:
+        if unregister_active_file:
+            unregister_active_file(mp3_path)
 
 
 # ---------- 引擎2：本地 VITS（sherpa-onnx，离线自然语音） ----------
@@ -376,17 +400,17 @@ def _speak_with_sapi(text):
 # ---------- 主入口 ----------
 def _current_order():
     """根据当前引擎偏好返回回退顺序"""
-    if _engine_pref == 'volcengine':
-        return ['volcengine', 'edge', 'pyttsx3', 'sapi', 'vits']
+    if _engine_pref == 'azure':
+        return ['azure', 'edge', 'pyttsx3', 'sapi', 'vits']
     if _engine_pref == 'edge':
         return ['edge', 'pyttsx3', 'sapi', 'vits']
     if _engine_pref == 'vits':
         return ['vits', 'edge', 'pyttsx3', 'sapi']
     if _engine_pref == 'pyttsx3':
         return ['pyttsx3', 'sapi']
-    # auto：火山(国内、音质高)优先；未配置 Key 时 _speak_with_volcengine 会
-    # 立即返回 False 并被缓存跳过，自动落到 edge；断网再掉本地机械音/气泡音
-    return ['volcengine', 'edge', 'pyttsx3', 'sapi', 'vits']
+    # auto：Azure(国内、音质高、支持感情风格)优先；未配置 Key/区域时
+    # _speak_with_azure 会立即返回 False 并被缓存跳过，自动落到 edge；断网再掉本地机械音/气泡音
+    return ['azure', 'edge', 'pyttsx3', 'sapi', 'vits']
 
 
 def _speak_cached(text):
@@ -399,8 +423,8 @@ def _speak_cached(text):
                 continue
         ok = False
         try:
-            if engine == 'volcengine':
-                ok = _speak_with_volcengine(text)
+            if engine == 'azure':
+                ok = _speak_with_azure(text)
             elif engine == 'edge':
                 ok = _speak_with_edge(text)
             elif engine == 'vits':

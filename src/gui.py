@@ -276,9 +276,9 @@ _runtime = {
     'tts_style': 'calm',
     'tts_rate': '-12%',
     'tts_pitch': '-6%',
-    'tts_api_key': '',                       # 火山(字节)语音合成 API Key
-    'tts_api_voice': 'zh_female_qingxin',    # 火山音色(控制台音色库可查)
-    'tts_api_speed': 1.0,                    # 语速比例(0.5~2.0)
+    'tts_azure_key': '',                     # Azure(微软)语音合成订阅密钥
+    'tts_azure_region': 'chinaeast2',        # Azure 区域(需与订阅资源一致)
+    'tts_azure_voice': 'zh-CN-XiaoxiaoNeural',  # Azure 神经语音音色
     'stop_words': ['停止', '停下', '闭嘴', '别说了', '打住'],
 }
 
@@ -324,15 +324,12 @@ def load_settings():
                 _runtime['tts_rate'] = data['tts_rate']
             if 'tts_pitch' in data and data['tts_pitch']:
                 _runtime['tts_pitch'] = data['tts_pitch']
-            if 'tts_api_key' in data:
-                _runtime['tts_api_key'] = data['tts_api_key']
-            if 'tts_api_voice' in data and data['tts_api_voice']:
-                _runtime['tts_api_voice'] = data['tts_api_voice']
-            if 'tts_api_speed' in data:
-                try:
-                    _runtime['tts_api_speed'] = float(data['tts_api_speed'])
-                except Exception:
-                    pass
+            if 'tts_azure_key' in data:
+                _runtime['tts_azure_key'] = data['tts_azure_key']
+            if 'tts_azure_region' in data and data['tts_azure_region']:
+                _runtime['tts_azure_region'] = data['tts_azure_region']
+            if 'tts_azure_voice' in data and data['tts_azure_voice']:
+                _runtime['tts_azure_voice'] = data['tts_azure_voice']
             if 'stop_words' in data:
                 sw = data['stop_words']
                 if isinstance(sw, str):
@@ -345,7 +342,8 @@ def load_settings():
 
 def save_settings(wake_words, sensitivity, tts_engine, tts_voice=None,
                   tts_style='calm', tts_rate='-12%', tts_pitch='-6%',
-                  tts_api_key='', tts_api_voice='zh_female_qingxin', tts_api_speed=1.0):
+                  tts_azure_key='', tts_azure_region='chinaeast2',
+                  tts_azure_voice='zh-CN-XiaoxiaoNeural'):
     """保存设置并更新运行时"""
     global _runtime
     _runtime['wake_words'] = wake_words
@@ -356,9 +354,9 @@ def save_settings(wake_words, sensitivity, tts_engine, tts_voice=None,
     _runtime['tts_style'] = tts_style
     _runtime['tts_rate'] = tts_rate
     _runtime['tts_pitch'] = tts_pitch
-    _runtime['tts_api_key'] = tts_api_key
-    _runtime['tts_api_voice'] = tts_api_voice
-    _runtime['tts_api_speed'] = tts_api_speed
+    _runtime['tts_azure_key'] = tts_azure_key
+    _runtime['tts_azure_region'] = tts_azure_region
+    _runtime['tts_azure_voice'] = tts_azure_voice
     try:
         with open(get_settings_file(), 'w', encoding='utf-8') as f:
             json.dump(_runtime, f, ensure_ascii=False, indent=2)
@@ -399,16 +397,16 @@ def get_tts_pitch():
     return _runtime.get('tts_pitch', '-6%')
 
 
-def get_tts_api_key():
-    return _runtime.get('tts_api_key', '')
+def get_tts_azure_key():
+    return _runtime.get('tts_azure_key', '')
 
 
-def get_tts_api_voice():
-    return _runtime.get('tts_api_voice', 'zh_female_qingxin')
+def get_tts_azure_region():
+    return _runtime.get('tts_azure_region', 'chinaeast2')
 
 
-def get_tts_api_speed():
-    return _runtime.get('tts_api_speed', 1.0)
+def get_tts_azure_voice():
+    return _runtime.get('tts_azure_voice', 'zh-CN-XiaoxiaoNeural')
 
 
 def show_settings():
@@ -465,7 +463,7 @@ def show_settings():
             f3 = tk.Frame(content, bg='#f5f7fa')
             f3.pack(fill='x', padx=16, pady=6)
             tk.Label(f3, text='语音引擎（TTS）', bg='#f5f7fa').pack(anchor='w')
-            tts_combo = ttk.Combobox(f3, values=['vits', 'edge', 'pyttsx3', 'volcengine', 'auto'], state='readonly')
+            tts_combo = ttk.Combobox(f3, values=['vits', 'edge', 'pyttsx3', 'azure', 'auto'], state='readonly')
             tts_combo.pack(fill='x')
             tts_combo.set(_runtime.get('tts_engine', 'vits'))
 
@@ -486,7 +484,7 @@ def show_settings():
             from src.feedback import EDGE_STYLE_OPTIONS
             f3c = tk.Frame(content, bg='#f5f7fa')
             f3c.pack(fill='x', padx=16, pady=6)
-            tk.Label(f3c, text='感情风格（edge 引擎时生效）', bg='#f5f7fa').pack(anchor='w')
+            tk.Label(f3c, text='感情风格（edge/azure 在线引擎时生效）', bg='#f5f7fa').pack(anchor='w')
             style_combo = ttk.Combobox(f3c, values=list(EDGE_STYLE_OPTIONS.keys()), state='readonly')
             style_combo.pack(fill='x')
             cur_style = _runtime.get('tts_style', 'calm')
@@ -499,7 +497,7 @@ def show_settings():
 
             f3d = tk.Frame(content, bg='#f5f7fa')
             f3d.pack(fill='x', padx=16, pady=6)
-            tk.Label(f3d, text='语速（edge 引擎时生效，负=慢，正=快）', bg='#f5f7fa').pack(anchor='w')
+            tk.Label(f3d, text='语速（edge/azure 在线引擎时生效，负=慢，正=快）', bg='#f5f7fa').pack(anchor='w')
             rate_combo = ttk.Combobox(f3d, state='readonly', values=[
                 '-20%', '-15%', '-12%', '-8%', '-5%', '0%', '+5%', '+10%', '+15%', '+20%'
             ])
@@ -508,36 +506,37 @@ def show_settings():
 
             f3e = tk.Frame(content, bg='#f5f7fa')
             f3e.pack(fill='x', padx=16, pady=6)
-            tk.Label(f3e, text='音调（edge 引擎时生效，负=低，正=高）', bg='#f5f7fa').pack(anchor='w')
+            tk.Label(f3e, text='音调（edge/azure 在线引擎时生效，负=低，正=高）', bg='#f5f7fa').pack(anchor='w')
             pitch_combo = ttk.Combobox(f3e, state='readonly', values=[
                 '-20%', '-15%', '-10%', '-6%', '-3%', '0%', '+3%', '+6%', '+10%', '+15%', '+20%'
             ])
             pitch_combo.pack(fill='x')
             pitch_combo.set(_runtime.get('tts_pitch', '-6%'))
 
-            # ---- 火山(字节)语音合成：国内节点、音质高，需 API Key ----
+            # ---- Azure(微软)语音合成：国内 azure.cn 节点、音质高，需订阅密钥 ----
             f3f = tk.Frame(content, bg='#f5f7fa')
             f3f.pack(fill='x', padx=16, pady=6)
-            tk.Label(f3f, text='火山语音 API Key（引擎选「火山」时填写，控制台「API Key 管理」获取）',
+            tk.Label(f3f, text='Azure 语音订阅密钥（引擎选「azure」或「auto」时填写，门户「密钥与终结点」获取）',
                      bg='#f5f7fa').pack(anchor='w')
-            volc_key_entry = tk.Entry(f3f, font=('Microsoft YaHei', 10), show='*')
-            volc_key_entry.pack(fill='x', ipady=3)
-            volc_key_entry.insert(0, _runtime.get('tts_api_key', ''))
+            azure_key_entry = tk.Entry(f3f, font=('Microsoft YaHei', 10), show='*')
+            azure_key_entry.pack(fill='x', ipady=3)
+            azure_key_entry.insert(0, _runtime.get('tts_azure_key', ''))
 
             f3g = tk.Frame(content, bg='#f5f7fa')
             f3g.pack(fill='x', padx=16, pady=6)
-            tk.Label(f3g, text='火山音色 ID（控制台「音色库」可查，如 zh_female_qingxin）',
+            tk.Label(f3g, text='Azure 区域（如 chinaeast2 / chinanorth，需与订阅资源一致）',
                      bg='#f5f7fa').pack(anchor='w')
-            volc_voice_entry = tk.Entry(f3g, font=('Microsoft YaHei', 10))
-            volc_voice_entry.pack(fill='x', ipady=3)
-            volc_voice_entry.insert(0, _runtime.get('tts_api_voice', 'zh_female_qingxin'))
+            azure_region_entry = tk.Entry(f3g, font=('Microsoft YaHei', 10))
+            azure_region_entry.pack(fill='x', ipady=3)
+            azure_region_entry.insert(0, _runtime.get('tts_azure_region', 'chinaeast2'))
 
             f3h = tk.Frame(content, bg='#f5f7fa')
             f3h.pack(fill='x', padx=16, pady=6)
-            tk.Label(f3h, text='火山语速比例（0.5~2.0，1.0=正常）', bg='#f5f7fa').pack(anchor='w')
-            volc_speed_entry = tk.Entry(f3h, font=('Microsoft YaHei', 10))
-            volc_speed_entry.pack(fill='x', ipady=3)
-            volc_speed_entry.insert(0, str(_runtime.get('tts_api_speed', 1.0)))
+            tk.Label(f3h, text='Azure 音色（如 zh-CN-XiaoxiaoNeural / zh-CN-YunxiNeural）',
+                     bg='#f5f7fa').pack(anchor='w')
+            azure_voice_entry = tk.Entry(f3h, font=('Microsoft YaHei', 10))
+            azure_voice_entry.pack(fill='x', ipady=3)
+            azure_voice_entry.insert(0, _runtime.get('tts_azure_voice', 'zh-CN-XiaoxiaoNeural'))
 
 
             f4 = tk.Frame(content, bg='#f5f7fa')
@@ -579,20 +578,19 @@ def show_settings():
                 rate = rate_combo.get() or '-12%'
                 pitch = pitch_combo.get() or '-6%'
                 model = model_combo.get()
-                volc_key = volc_key_entry.get().strip()
-                volc_voice = volc_voice_entry.get().strip() or 'zh_female_qingxin'
-                try:
-                    volc_speed = float(volc_speed_entry.get().strip() or '1.0')
-                except Exception:
-                    volc_speed = 1.0
+                azure_key = azure_key_entry.get().strip()
+                azure_region = azure_region_entry.get().strip() or 'chinaeast2'
+                azure_voice = azure_voice_entry.get().strip() or 'zh-CN-XiaoxiaoNeural'
                 save_settings(ww, sens, tts, voice, style, rate, pitch,
-                              tts_api_key=volc_key, tts_api_voice=volc_voice, tts_api_speed=volc_speed)
+                              tts_azure_key=azure_key, tts_azure_region=azure_region,
+                              tts_azure_voice=azure_voice)
                 if model:
                     save_selected_model(model)
                 try:
                     from src.feedback import configure_tts
                     configure_tts(tts, voice, style, rate, pitch,
-                                  api_key=volc_key, api_voice=volc_voice, api_speed=volc_speed)
+                                  azure_key=azure_key, azure_region=azure_region,
+                                  azure_voice=azure_voice)
                 except Exception:
                     pass
                 try:

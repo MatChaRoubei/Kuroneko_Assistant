@@ -79,7 +79,7 @@ from src.recognize import SpeechRecognizer, SherpaONNXRecognizer, check_speech_d
 from src.nlu.phonetic_corrector import PhoneticCorrector
 from src.nlu.fuzzy_regex import FuzzyRegexMatcher
 from src.tray import start_tray
-from src.gui import load_selected_model, append_asr, append_output, set_status, start_main_window, load_settings, get_wake_words, get_tts_engine, get_tts_voice, get_sensitivity, get_stop_words, get_tts_style, get_tts_rate, get_tts_pitch, get_tts_api_key, get_tts_api_voice, get_tts_api_speed
+from src.gui import load_selected_model, append_asr, append_output, set_status, start_main_window, load_settings, get_wake_words, get_tts_engine, get_tts_voice, get_sensitivity, get_stop_words, get_tts_style, get_tts_rate, get_tts_pitch, get_tts_azure_key, get_tts_azure_region, get_tts_azure_voice
 
 # 打断（barge-in）总开关：播放/生成期间主人开口即中断当前播报。
 # 设为 False 可关闭（仅保留停止词中断）。后续可接入 settings.json 由 GUI 控制。
@@ -140,7 +140,8 @@ def main():
     # 配置 TTS 引擎（含感情风格/语速/音调，均来自 GUI 设置）
     configure_tts(get_tts_engine(), get_tts_voice(),
                   get_tts_style(), get_tts_rate(), get_tts_pitch(),
-                  api_key=get_tts_api_key(), api_voice=get_tts_api_voice(), api_speed=get_tts_api_speed())
+                  azure_key=get_tts_azure_key(), azure_region=get_tts_azure_region(),
+                  azure_voice=get_tts_azure_voice())
     warmup_tts()
     configure_ollama(load_selected_model() or cfg.get('ollama_model'))
     configure_logging(cfg.get('log_file'))

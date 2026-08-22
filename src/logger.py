@@ -1,5 +1,6 @@
 import logging
 import os
+from logging.handlers import RotatingFileHandler
 
 
 def configure_logging(log_file=None):
@@ -9,7 +10,12 @@ def configure_logging(log_file=None):
         if log_dir and not os.path.isdir(log_dir):
             os.makedirs(log_dir, exist_ok=True)
         try:
-            handlers.append(logging.FileHandler(log_file, encoding='utf-8'))
+            # 滚动日志：单文件最大 5MB，保留 3 个备份（共约 20MB 上限）。
+            # 避免长期运行无限累积把磁盘写爆（旧版 assistant.log 曾涨到数百 MB）。
+            handlers.append(RotatingFileHandler(
+                log_file, maxBytes=5 * 1024 * 1024, backupCount=3,
+                encoding='utf-8'
+            ))
         except (OSError, IOError) as e:
             print(f'无法创建日志文件 {log_file}: {e}')
 
