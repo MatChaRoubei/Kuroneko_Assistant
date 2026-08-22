@@ -276,6 +276,9 @@ _runtime = {
     'tts_style': 'calm',
     'tts_rate': '-12%',
     'tts_pitch': '-6%',
+    'tts_api_key': '',                       # 火山(字节)语音合成 API Key
+    'tts_api_voice': 'zh_female_qingxin',    # 火山音色(控制台音色库可查)
+    'tts_api_speed': 1.0,                    # 语速比例(0.5~2.0)
     'stop_words': ['停止', '停下', '闭嘴', '别说了', '打住'],
 }
 
@@ -321,6 +324,15 @@ def load_settings():
                 _runtime['tts_rate'] = data['tts_rate']
             if 'tts_pitch' in data and data['tts_pitch']:
                 _runtime['tts_pitch'] = data['tts_pitch']
+            if 'tts_api_key' in data:
+                _runtime['tts_api_key'] = data['tts_api_key']
+            if 'tts_api_voice' in data and data['tts_api_voice']:
+                _runtime['tts_api_voice'] = data['tts_api_voice']
+            if 'tts_api_speed' in data:
+                try:
+                    _runtime['tts_api_speed'] = float(data['tts_api_speed'])
+                except Exception:
+                    pass
             if 'stop_words' in data:
                 sw = data['stop_words']
                 if isinstance(sw, str):
@@ -332,7 +344,8 @@ def load_settings():
 
 
 def save_settings(wake_words, sensitivity, tts_engine, tts_voice=None,
-                  tts_style='calm', tts_rate='-12%', tts_pitch='-6%'):
+                  tts_style='calm', tts_rate='-12%', tts_pitch='-6%',
+                  tts_api_key='', tts_api_voice='zh_female_qingxin', tts_api_speed=1.0):
     """保存设置并更新运行时"""
     global _runtime
     _runtime['wake_words'] = wake_words
@@ -343,6 +356,9 @@ def save_settings(wake_words, sensitivity, tts_engine, tts_voice=None,
     _runtime['tts_style'] = tts_style
     _runtime['tts_rate'] = tts_rate
     _runtime['tts_pitch'] = tts_pitch
+    _runtime['tts_api_key'] = tts_api_key
+    _runtime['tts_api_voice'] = tts_api_voice
+    _runtime['tts_api_speed'] = tts_api_speed
     try:
         with open(get_settings_file(), 'w', encoding='utf-8') as f:
             json.dump(_runtime, f, ensure_ascii=False, indent=2)
@@ -381,6 +397,18 @@ def get_tts_rate():
 
 def get_tts_pitch():
     return _runtime.get('tts_pitch', '-6%')
+
+
+def get_tts_api_key():
+    return _runtime.get('tts_api_key', '')
+
+
+def get_tts_api_voice():
+    return _runtime.get('tts_api_voice', 'zh_female_qingxin')
+
+
+def get_tts_api_speed():
+    return _runtime.get('tts_api_speed', 1.0)
 
 
 def show_settings():
@@ -437,7 +465,7 @@ def show_settings():
             f3 = tk.Frame(content, bg='#f5f7fa')
             f3.pack(fill='x', padx=16, pady=6)
             tk.Label(f3, text='语音引擎（TTS）', bg='#f5f7fa').pack(anchor='w')
-            tts_combo = ttk.Combobox(f3, values=['vits', 'edge', 'pyttsx3', 'auto'], state='readonly')
+            tts_combo = ttk.Combobox(f3, values=['vits', 'edge', 'pyttsx3', 'volcengine', 'auto'], state='readonly')
             tts_combo.pack(fill='x')
             tts_combo.set(_runtime.get('tts_engine', 'vits'))
 
@@ -487,6 +515,30 @@ def show_settings():
             pitch_combo.pack(fill='x')
             pitch_combo.set(_runtime.get('tts_pitch', '-6%'))
 
+            # ---- 火山(字节)语音合成：国内节点、音质高，需 API Key ----
+            f3f = tk.Frame(content, bg='#f5f7fa')
+            f3f.pack(fill='x', padx=16, pady=6)
+            tk.Label(f3f, text='火山语音 API Key（引擎选「火山」时填写，控制台「API Key 管理」获取）',
+                     bg='#f5f7fa').pack(anchor='w')
+            volc_key_entry = tk.Entry(f3f, font=('Microsoft YaHei', 10), show='*')
+            volc_key_entry.pack(fill='x', ipady=3)
+            volc_key_entry.insert(0, _runtime.get('tts_api_key', ''))
+
+            f3g = tk.Frame(content, bg='#f5f7fa')
+            f3g.pack(fill='x', padx=16, pady=6)
+            tk.Label(f3g, text='火山音色 ID（控制台「音色库」可查，如 zh_female_qingxin）',
+                     bg='#f5f7fa').pack(anchor='w')
+            volc_voice_entry = tk.Entry(f3g, font=('Microsoft YaHei', 10))
+            volc_voice_entry.pack(fill='x', ipady=3)
+            volc_voice_entry.insert(0, _runtime.get('tts_api_voice', 'zh_female_qingxin'))
+
+            f3h = tk.Frame(content, bg='#f5f7fa')
+            f3h.pack(fill='x', padx=16, pady=6)
+            tk.Label(f3h, text='火山语速比例（0.5~2.0，1.0=正常）', bg='#f5f7fa').pack(anchor='w')
+            volc_speed_entry = tk.Entry(f3h, font=('Microsoft YaHei', 10))
+            volc_speed_entry.pack(fill='x', ipady=3)
+            volc_speed_entry.insert(0, str(_runtime.get('tts_api_speed', 1.0)))
+
 
             f4 = tk.Frame(content, bg='#f5f7fa')
             f4.pack(fill='x', padx=16, pady=6)
@@ -527,12 +579,20 @@ def show_settings():
                 rate = rate_combo.get() or '-12%'
                 pitch = pitch_combo.get() or '-6%'
                 model = model_combo.get()
-                save_settings(ww, sens, tts, voice, style, rate, pitch)
+                volc_key = volc_key_entry.get().strip()
+                volc_voice = volc_voice_entry.get().strip() or 'zh_female_qingxin'
+                try:
+                    volc_speed = float(volc_speed_entry.get().strip() or '1.0')
+                except Exception:
+                    volc_speed = 1.0
+                save_settings(ww, sens, tts, voice, style, rate, pitch,
+                              tts_api_key=volc_key, tts_api_voice=volc_voice, tts_api_speed=volc_speed)
                 if model:
                     save_selected_model(model)
                 try:
                     from src.feedback import configure_tts
-                    configure_tts(tts, voice, style, rate, pitch)
+                    configure_tts(tts, voice, style, rate, pitch,
+                                  api_key=volc_key, api_voice=volc_voice, api_speed=volc_speed)
                 except Exception:
                     pass
                 try:
