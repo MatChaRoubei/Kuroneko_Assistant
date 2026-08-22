@@ -360,8 +360,11 @@ def main():
                     start_barge_in_listener(recognizer)
                 result = execute_intent(intent_name, slots, query)
                 # 等 TTS 队列播报完再结束输出，确保播放期间停止词/开口打断始终有效
+                # 注意：wait_speaking_done 已在文件顶部导入为全局名，此处直接调用，
+                # 不可再写 `from src.feedback import wait_speaking_done`，否则会把它
+                # 变成当前函数的局部变量，导致函数前面（line 241/261）对它的调用
+                # 报 "cannot access local variable 'wait_speaking_done'"（未绑定局部变量）。
                 try:
-                    from src.feedback import wait_speaking_done
                     wait_speaking_done()
                 except Exception:
                     pass
