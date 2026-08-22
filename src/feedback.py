@@ -139,24 +139,6 @@ _EDGE_RATE = '-12%'       # 语速放慢，更松弛慵懒
 _EDGE_PITCH = '-6%'       # 音调略降，更沉稳
 
 
-def _edge_ssml(text):
-    """把纯文本包装成带感情风格与语调的 SSML，让 Edge 神经语音更有感情。"""
-    import xml.sax.saxutils as su
-    safe = su.escape(text)
-    # 风格包裹：none 时不加 express-as，纯靠 prosody 调语调
-    if _EDGE_STYLE and _EDGE_STYLE != 'none':
-        express = (f'<mstts:express-as style="{_EDGE_STYLE}">'
-                   f'<prosody rate="{_EDGE_RATE}" pitch="{_EDGE_PITCH}">{safe}</prosody>'
-                   '</mstts:express-as>')
-    else:
-        express = f'<prosody rate="{_EDGE_RATE}" pitch="{_EDGE_PITCH}">{safe}</prosody>'
-    return (
-        '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" '
-        'xmlns:mstts="https://www.w3.org/2001/mstts" xml:lang="zh-CN">'
-        f'<voice name="{_edge_voice}">{express}</voice></speak>'
-    )
-
-
 def _speak_with_edge(text):
     try:
         import asyncio
@@ -169,8 +151,16 @@ def _speak_with_edge(text):
         if register_active_file:
             register_active_file(mp3_path)  # 标记正在使用，清理时跳过
         try:
-            # 用 SSML 注入感情风格与语调（平静慵懒），比纯文本更有感情
-            communicate = edge_tts.Communicate(_edge_ssml(text), voice=_edge_voice)
+            # 重要：edge_tts 的 Communicate 会把传入文本 escape 后当作纯文本，
+            # 若传入 SSML 字符串，<speak ...> 标签会被逐字朗读（用户听到的
+            # "speak version 1.0 / synthesis" 正是这个 bug）。因此必须传纯文本，
+            # 并用 rate/pitch 参数控制语速与音调（edge_tts 不支持 express-as 风格）。
+            communicate = edge_tts.Communicate(
+                text,
+                voice=_edge_voice,
+                rate=_EDGE_RATE,
+                pitch=_EDGE_PITCH,
+            )
             asyncio.run(communicate.save(mp3_path))
             _play_mp3(mp3_path)
             return True
