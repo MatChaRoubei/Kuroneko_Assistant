@@ -271,7 +271,7 @@ class MainWindow:
 _runtime = {
     'wake_words': ['你好黑猫', '助手', '黑猫', '你好助手'],
     'sensitivity': 0.8,
-    'tts_engine': 'edge',                     # 默认 edge：微软免费在线神经语音，无需注册/卡号
+    'tts_engine': 'vits',                     # 默认 vits：本地离线神经语音，零网络延迟、无需注册/卡号
     'tts_voice': 'zh-CN-XiaoxiaoNeural',
     'tts_style': 'calm',
     'tts_rate': '-5%',                        # 语速：轻微放慢更从容；过慢(-12%)会显人机
@@ -462,10 +462,10 @@ def show_settings():
 
             f3 = tk.Frame(content, bg='#f5f7fa')
             f3.pack(fill='x', padx=16, pady=6)
-            tk.Label(f3, text='语音引擎（TTS）', bg='#f5f7fa').pack(anchor='w')
+            tk.Label(f3, text='语音引擎（TTS）：vits=本地离线(零延迟) / edge=联网免费 / pyttsx3=系统机械音 / azure=需卡号', bg='#f5f7fa').pack(anchor='w')
             tts_combo = ttk.Combobox(f3, values=['vits', 'edge', 'pyttsx3', 'azure', 'auto'], state='readonly')
             tts_combo.pack(fill='x')
-            tts_combo.set(_runtime.get('tts_engine', 'edge'))
+            tts_combo.set(_runtime.get('tts_engine', 'vits'))
 
             f3b = tk.Frame(content, bg='#f5f7fa')
             f3b.pack(fill='x', padx=16, pady=6)

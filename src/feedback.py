@@ -58,8 +58,9 @@ _tts_engine_ttl = 60  # 秒
 def configure_tts(engine='auto', voice='zh-CN-XiaoxiaoNeural',
                   style='calm', rate='-5%', pitch='+0Hz',
                   azure_key=None, azure_region=None, azure_voice=None):
-    """设置 TTS 引擎偏好：auto / edge / vits / pyttsx3 / azure，
-    以及在线神经语音(edge/azure)通用的感情风格/语速/音调。"""
+    """设置 TTS 引擎偏好：auto / vits / edge / pyttsx3 / azure，
+    以及在线神经语音(edge/azure)通用的感情风格/语速/音调。
+    auto 默认本地 VITS 优先(零网络延迟)，无模型/失败时回落 edge。"""
     global _engine_pref, _edge_voice, _EDGE_STYLE, _EDGE_RATE, _EDGE_PITCH
     global _AZURE_KEY, _AZURE_REGION, _AZURE_VOICE
     if engine:
@@ -428,10 +429,10 @@ def _current_order():
         return ['vits', 'edge', 'pyttsx3', 'sapi']
     if _engine_pref == 'pyttsx3':
         return ['pyttsx3', 'sapi']
-    # auto：edge(微软免费在线神经语音，无需注册/信用卡)优先；
-    # 若用户显式选了「azure」且填了有效 Key，则会在前面优先用 Azure；
-    # 断网时回退本地机械音/气泡音兜底
-    return ['edge', 'azure', 'pyttsx3', 'sapi', 'vits']
+    # auto：本地 VITS(已打包进 exe，零网络延迟、离线可用)优先；
+    # 若 VITS 模型缺失/初始化失败，则回落 edge(微软免费在线神经语音，无需注册/信用卡)；
+    # 断网或 edge 失败再回退本地机械音/气泡音兜底
+    return ['vits', 'edge', 'azure', 'pyttsx3', 'sapi']
 
 
 def _speak_cached(text):
