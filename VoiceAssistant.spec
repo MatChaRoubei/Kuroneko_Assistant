@@ -5,15 +5,15 @@ import os
 # SPECPATH 为 spec 文件所在目录（项目根）
 project_root = SPECPATH
 
-# 单文件 exe 运行时解压目录：放到 exe 旁边的 temp 目录（D 盘），
-# 避免每次运行都往 C 盘系统临时目录解压约 0.5GB 资源
-runtime_tmpdir = os.path.join(SPECPATH, 'dist', 'temp')
-os.makedirs(runtime_tmpdir, exist_ok=True)
+# Folder distribution avoids unpacking hundreds of MB on every launch.
+# Never embed the build machine's absolute path in runtime_tmpdir.
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 # 打包的数据文件
 datas = [
     (os.path.join(project_root, 'icon.ico'), '.'),
-    (os.path.join(project_root, 'firstUI.png'), '.'),
+    (os.path.join(project_root, 'version_info.txt'), '.'),
+    (os.path.join(project_root, 'models', 'vad', 'silero_vad.onnx'), os.path.join('models', 'vad')),
     (os.path.join(project_root, 'config'), 'config'),
     (os.path.join(project_root, 'data'), 'data'),
     (os.path.join(project_root, 'plugins'), 'plugins'),
@@ -28,6 +28,9 @@ kws_dir = os.path.join(project_root, 'models', 'kws')
 if os.path.isdir(kws_dir) and os.path.exists(os.path.join(kws_dir, 'tokens.txt')):
     datas.append((kws_dir, os.path.join('models', 'kws')))
 
+datas += collect_data_files('fake_useragent')
+datas += collect_data_files('jieba')
+
 a = Analysis(
     [os.path.join(project_root, 'src', 'main.py')],
     pathex=[project_root],
@@ -36,14 +39,12 @@ a = Analysis(
     hiddenimports=[
         'numpy',
         'sounddevice',
-        'SpeechRecognition',
-        'pyyaml',
+        'speech_recognition',
+        'yaml',
         'win10toast',
         'pyttsx3',
         'pyttsx3.drivers',
         'pyttsx3.drivers.sapi5',
-        'pyttsx3.drivers.nsss',
-        'pyttsx3.drivers.espeak',
         'win32com',
         'win32com.client',
         'pythoncom',
@@ -69,6 +70,14 @@ a = Analysis(
         'primp',
         'fake_useragent',
         'src.debug_tool',
+        'src.executor',
+        'src.recognize',
+        'src.feedback',
+        'src.nlu.phonetic_corrector',
+        'src.nlu.fuzzy_regex',
+        'sherpa_onnx',
+        'sherpa_onnx.lib._sherpa_onnx',
+        'PIL.ImageTk',
         # ===== 下面这些是 Python 标准库，需要显式声明 =====
         'wave',
         'audioop',
@@ -101,9 +110,8 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,
     name='VoiceAssistant',
     icon=os.path.join(project_root, 'icon.ico'),
     version=os.path.join(project_root, 'version_info.txt'),
@@ -112,7 +120,7 @@ exe = EXE(
     strip=False,
     upx=False,
     upx_exclude=[],
-    runtime_tmpdir=runtime_tmpdir,
+    runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -122,3 +130,9 @@ exe = EXE(
 )
 
 
+
+coll = COLLECT(
+    exe, a.binaries, a.datas,
+    strip=False, upx=False,
+    name='VoiceAssistant',
+)

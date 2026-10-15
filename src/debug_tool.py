@@ -9,6 +9,10 @@
     （main.py 检测到 --debug 会直接调用 run_diagnostics 并退出）
   - 托盘菜单：  「🔧 运行诊断」会以后台方式启动上述 --debug 进程
 
+选项：
+  --no-file   不写 debug_report.txt（仅打印到控制台）
+  --quiet     仅打印汇总与结论（跳过各检查明细）
+
 无控制台(windowed)运行时，报告会写入 exe 旁的 debug_report.txt 并尝试用
 默认程序打开。
 """
@@ -16,6 +20,7 @@ import sys
 import os
 import json
 import re
+import argparse
 import platform
 import importlib
 import urllib.request
@@ -74,15 +79,22 @@ def check_environment():
     return '运行环境', rows
 
 
+# 已知「可选但缺失时影响有限」的依赖：给出更友好的影响说明，而非底层报错串
+_OPTIONAL_DEPS = {
+    'SpeechRecognition': 'Google 在线 STT 回退将不可用（离线识别/本地模型不受影响）',
+    'win10toast': 'Windows 原生 Toast 通知不可用（托盘/SAPI 提示不受影响；多为 setuptools 在 Py3.12+ 移除 pkg_resources 的连带问题）',
+}
+
+
 def check_dependencies():
     rows = []
     deps = [
         ('numpy', '核心数值计算'),
         ('yaml', '配置解析(PyYAML)'),
         ('sounddevice', '音频采集/播放'),
-        ('SpeechRecognition', 'Google STT 回退(可选)'),
+        ('speech_recognition', 'Google STT 回退(可选)'),
         ('pyttsx3', '机械音 TTS 兜底'),
-        ('win10toast', '系统通知'),
+        ('win10toast', '系统通知(可选)'),
         ('ollama', '本地大模型对话'),
         ('edge_tts', '在线神经语音'),
         ('pystray', '系统托盘'),
@@ -107,7 +119,12 @@ def check_dependencies():
         if ok:
             rows.append((f'{name}（{desc}）', 'OK', '已安装'))
         else:
-            rows.append((f'{name}（{desc}）', 'WARN', '缺失: ' + err))
+            impact = _OPTIONAL_DEPS.get(name)
+            if impact:
+                detail = '缺失(可选): ' + impact
+            else:
+                detail = '缺失: ' + err
+            rows.append((f'{name}（{desc}）', 'WARN', detail))
             missing.append(name)
     if missing:
         rows.append(('缺失依赖汇总', 'WARN',
@@ -199,10 +216,9 @@ def check_audio():
         rows.append(('音频设备总数', 'INFO', str(len(devices))))
         rows.append(('输入设备(麦克风)数', 'OK' if inputs else 'FAIL', str(len(inputs))))
         try:
-            dev_id = sd.default.device
-            if isinstance(dev_id, (list, tuple)):
-                dev_id = dev_id[0]
-            dev = sd.query_devices(dev_id)
+            # sounddevice 的 sd.default.device 在输入/输出设备不同时返回 [输入, 输出] 列表，
+            # 直接用 kind='input' 取默认输入设备最稳妥。
+            dev = sd.query_devices(kind='input')
             rows.append(('默认输入设备', 'INFO',
                          f"{dev['name']} @ {int(dev['default_samplerate'])}Hz"))
         except Exception as e:
@@ -254,7 +270,9 @@ def check_tts():
     rows = []
     ok, err = _dep_import('edge_tts')
     rows.append(('Edge 在线语音', 'OK' if ok else 'WARN',
-                 '可用(需联网)' if ok else '缺失: ' + err))
+                 '依赖已安装；连接和合成尚未验证，请在设置的声音页检测' if ok else '缺失: ' + err))
+    rows.append(('GPT-SoVITS 角色语音', 'INFO',
+                 '仅包含客户端接口，不包含服务、角色模型或参考音频；请在角色声音页检测实际合成'))
     ok2, err2 = _dep_import('sherpa_onnx')
     res = _find_model_files()
     vm, vt, _ = res['vits']
@@ -281,6 +299,21 @@ def check_tts():
     return 'TTS 语音引擎检查', rows
 
 
+def check_voice_synthesis():
+    """Opt-in active check: synthesize using the user's selected engine, no sound."""
+    from src.storage import read_json, user_file
+    from src.voice_health import probe
+    settings = read_json(user_file('settings.json'), {}) or {}
+    engine = settings.get('tts_engine', 'vits')
+    values = {'voice': settings.get('tts_voice', 'zh-CN-XiaoxiaoNeural'),
+              'rate': settings.get('tts_rate', '+0%'), 'pitch': settings.get('tts_pitch', '+0Hz'),
+              'key': settings.get('tts_azure_key', ''), 'region': settings.get('tts_azure_region', ''),
+              'azure_voice': settings.get('tts_azure_voice', 'zh-CN-XiaoxiaoNeural'),
+              'style': settings.get('tts_style', 'none'), 'character': settings.get('character_voice', {})}
+    ok, message = probe(engine, values)
+    return '实际语音合成（不播放、不回退）', [(engine, 'OK' if ok else 'FAIL', message)]
+
+
 def check_intents():
     rows = []
     expect_map = {
@@ -292,6 +325,10 @@ def check_intents():
         '忘记我喜欢喝咖啡': 'forget',
         '关机': 'systemShutdown',
         '你好黑猫': 'unknown',
+        '五分钟后提醒我喝水': 'set_timer',
+        '音量大一点': 'adjust_volume',
+        '不要关机': 'unknown',
+        '查看提醒': 'list_reminders',
     }
     try:
         from src.intents import IntentParser
@@ -313,11 +350,16 @@ def check_modules():
     mods = [
         'src.config', 'src.logger', 'src.intents', 'src.plugins', 'src.cleaner',
         'src.stop', 'src.feedback', 'src.recognize', 'src.tray', 'src.gui',
-        'src.executor', 'src.main',
+        'src.executor', 'src.main', 'src.settings_ui', 'src.endpoint', 'src.reminders', 'src.character_tts',
         'src.nlu.phonetic_corrector', 'src.nlu.fuzzy_regex', 'src.nlu.rules',
         'src.nlu.wake_word_detector', 'src.nlu.douyin_controller',
     ]
     for m in mods:
+        if m == 'src.main' and getattr(sys, 'frozen', False):
+            # PyInstaller runs the entry script as __main__, not an importable
+            # src.main module. Re-importing it would also reopen runtime logs.
+            rows.append(('程序入口', 'OK', '打包入口已执行'))
+            continue
         ok, err = _dep_import(m)
         rows.append((f'导入 {m}', 'OK' if ok else 'FAIL',
                      '成功' if ok else '失败: ' + err))
@@ -326,9 +368,9 @@ def check_modules():
 
 def check_memory():
     rows = []
-    rr = _get_resource_root()
+    from src.storage import user_file
     for f in ('chat_memory.json', 'long_term_memory.json'):
-        p = os.path.join(rr, f)
+        p = user_file(f)
         if os.path.exists(p):
             try:
                 with open(p, encoding='utf-8') as fh:
@@ -376,6 +418,8 @@ def run_diagnostics(cli=False, write_file=True):
         check_memory(),
         check_version(),
     ]
+    if '--check-voice' in sys.argv:
+        sections.append(check_voice_synthesis())
     lines = []
     lines.append('=' * 64)
     lines.append('黑猫语音助手 - 诊断报告')
@@ -416,6 +460,8 @@ def _write_report(text):
                                'debug_report.txt')
         else:
             out = os.path.join(os.getcwd(), 'debug_report.txt')
+        from src.storage import user_file
+        out = user_file('debug_report.txt')
         with open(out, 'w', encoding='utf-8') as f:
             f.write(text)
         if sys.platform == 'win32':

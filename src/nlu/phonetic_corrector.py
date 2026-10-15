@@ -221,7 +221,7 @@ class PhoneticCorrector:
             return text
 
         original = text
-        text = text.strip().lower()
+        text = text.strip()
 
         # 0. 如果输入文本本身就是一个已知命令，直接返回（避免误纠正）
         if text in self.commands:
@@ -229,30 +229,14 @@ class PhoneticCorrector:
 
         # 1. 检查常见ASR错误映射（快速路径）
         for error, correct in self._common_asr_errors.items():
-            if error in text:
-                text = text.replace(error, correct)
+            if text.startswith(error):
+                text = correct + text[len(error):]
 
         # 2. 中文数字转换（如"百分之五十" -> "50"，"八十" -> "80"）
-        text = self._convert_chinese_number(text)
+        # Numeric conversion belongs to slots. Global replacement corrupts
+        # names/content such as “三文鱼”, “三体”, and “一切顺利”.
+        return text
 
-        # 2. 尝试拼音相似度匹配
-        text_pinyin = self._to_pinyin(text)
-
-        best_match = None
-        best_score = 0
-        threshold = 0.75  # 相似度阈值
-
-        for i, cmd_pinyin in enumerate(self.command_pinyin):
-            # 使用快速 fuzz 过滤
-            score = self._calc_similarity(text_pinyin, cmd_pinyin)
-            if score > best_score and score >= threshold:
-                best_score = score
-                best_match = self.commands[i]
-
-        if best_match and best_match != text:
-            return best_match
-
-        return text  # 返回已转换（包括中文数字转换）后的文本
 
     def add_commands(self, commands):
         """动态添加命令到语料库"""

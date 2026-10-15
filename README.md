@@ -1,12 +1,52 @@
 # 黑猫语音助手
 
+## 本地体验改进版（0.0.9）
+
+本次修改后的分发包位于 `dist/BlackCatAssistant-portable.zip`。把完整压缩包发给别人，解压后双击里面的 `VoiceAssistant.exe` 即可，无需 Python 或管理员权限。请保留 `_internal` 文件夹；详细步骤见 `QUICKSTART.txt`。
+
+- 窗口先显示，再后台加载模型；文本输入不依赖麦克风，可直接回车发送。用 ↑↓ 找回最近输入，未发送草稿会保留。
+- 设置分为常用、语音输入、声音、角色声音、AI 对话、高级六页，使用中文选项；当前引擎不支持的选项会禁用。刷新模型保留选择，修改未保存时关闭会提醒。
+- 处理期间明确提示输入状态；暂停后点击重试麦克风会恢复监听。修复刚发送就停止仍执行指令的问题。
+- 新增暂停/恢复监听、停止回答（Esc）、重试麦克风、退出；重复启动唤起已有窗口。
+- 回答逐段显示与播报，停止在等待 AI 首个字时也能生效；队列会等待全部句子播放完成。
+- 语音使用 Silero 神经端点检测，说完约 0.5 秒结束录音，不再攒固定数秒窗口；保留开头缓冲，修复本地识别 PCM 格式；关闭容易被扬声器回声触发的能量打断，保留停止词及按钮停止。
+- 模型检测在后台进行，设置窗口共用主界面线程；可缩放布局，滚动阅读时不强行跳到底部。
+- 设置和记忆采用原子保存。分发版默认写入 `%LOCALAPPDATA%\KuronekoAssistant`，不会把个人聊天或密钥放进分享包。exe 旁放置 `portable.flag` 可改用 `userdata`。
+- 文件夹分发避免每次启动解压全部模型，已验证本地识别模型可从中文路径加载。
+
+新增功能：主窗口“说一句”/F8、麦克风选择、可选连续对话、可保存和取消的提醒、音量查询/增减/静音、媒体键及前台窗口操作。具体实现、真实测试数据和限制见 `docs/语音检查报告.md`。
+
+旧 `dist/VoiceAssistant.exe` 和原快捷方式现在转到新版；旧文件保存在 `dist/legacy`。分享时仍发送 `dist/BlackCatAssistant-portable.zip`，无需带开发目录或旧文件。
+
+0.0.9 已适配微软合成服务新地址，真实验证晓晓、晓伊和日语 Nanami 音频生成。增加实际合成检测和通用试听；在线失败会明确说明并优先回退本地自然语音。设置内容可滚动。
+
+角色声音仅提供 GPT-SoVITS 本机服务的客户端接口，安装包未包含该服务、角色模型或参考音频。中文为主、少量日语口头禅；需另行提供角色参考音频或模型。当前没有已验证的五更琉璃声音权重，通用 VITS/微软声音不会被宣称为该角色音色。
+
+源码运行：
+
+```powershell
+python -m pip install -r requirements.txt
+python setup_models.py
+python src/main.py
+```
+
+构建分享包（会检查模型完整性）：
+
+```powershell
+python build_release.py
+```
+
+回归验证：`python -m unittest discover -s tests -v`。AI 对话仍需在使用者电脑安装 Ollama 和聊天模型；基本系统指令及已打包的语音模型不依赖 Ollama。
+
+下面的 GitHub 下载链接是此前已发布版本，尚不包含本地体验修改。
+
 一个常驻后台的 Windows 语音助手：持续监听唤醒词，听到「你好黑猫」后即可下达指令。支持语音控制 Windows、AI 大模型对话（Ollama）、磁盘清理等，带图形主窗口和系统托盘图标。
 
 ## 下载
 
 预编译的单文件版本（含全部模型依赖，开箱即用）：
 
-- **v0.0.4（当前版本）**：[VoiceAssistant.exe（约 477 MB）](https://github.com/MatChaRoubei/Kuroneko_Assistant/releases/download/v0.0.4/VoiceAssistant.exe)
+- **v0.0.4（已发布版本）**：[VoiceAssistant.exe（约 477 MB）](https://github.com/MatChaRoubei/Kuroneko_Assistant/releases/download/v0.0.4/VoiceAssistant.exe)
   - 发布页（含变更说明）：<https://github.com/MatChaRoubei/Kuroneko_Assistant/releases/tag/v0.0.4>
   - 详见文末「v0.0.4」章节。
 - **v0.0.3**：[VoiceAssistant.exe（约 477 MB）](https://github.com/MatChaRoubei/Kuroneko_Assistant/releases/download/v0.0.3/VoiceAssistant.exe)
@@ -152,13 +192,13 @@ python setup_models.py
 - 有模型 → 使用 Sherpa-onnx 本地离线识别
 - 无模型 → 自动切换到 Google STT（需要网络）
 
-> **注意**：项目路径不能包含中文/非 ASCII 字符（如 `C:\我的项目`），否则 sherpa-onnx 无法加载模型。
+> 当前构建已验证本地识别模型可从中文路径加载；请使用 requirements.txt 指定范围内的 sherpa-onnx。
 
 ## 运行
 
 ### 方式一：直接运行打包好的 exe（推荐）
 
-双击 `dist\VoiceAssistant.exe`，会弹出图形主窗口并常驻系统托盘。
+解压 `dist\BlackCatAssistant-portable.zip` 后双击里面的 `VoiceAssistant.exe`，会弹出图形主窗口并常驻系统托盘。
 
 ### 方式二：源码运行
 
@@ -227,7 +267,7 @@ confirm_dangerous_actions: true
 ollama_model: ''
 ```
 
-> 用户手动选择的设置（唤醒词、灵敏度、引擎、声音角色、模型）会持久化到 exe 旁的 `settings.json` 和 `model_selection.json`，优先于 `config.yaml`。
+> 分发版设置和记忆默认保存在 `%LOCALAPPDATA%\KuronekoAssistant`；便携模式保存在 exe 旁的 `userdata`。源码运行保存在项目根目录。用户设置优先于 `config.yaml`。
 
 ## 项目结构
 
@@ -308,7 +348,7 @@ pip install pyinstaller
 pyinstaller VoiceAssistant.spec
 ```
 
-打包产物在 `dist\VoiceAssistant.exe`（单文件、无控制台窗口、带图标和版本信息）。运行时的临时文件会自动重定向到 exe 旁的 `temp` 目录，并定期清理。
+默认打包产物在 `dist\VoiceAssistant\VoiceAssistant.exe`（文件夹分发、无控制台窗口、带图标和版本信息）。推荐运行 `python build_release.py`，自动生成不含个人数据的分享压缩包。临时音频位于用户数据目录的 `temp`，只清理应用自己的旧音频。
 
 > **打包前准备**：本地语音识别依赖 `models/sense_voice/` 下的模型；若仓库不含模型，先运行 `python setup_models.py` 下载，或打包时把模型目录一并放入 `dist\` 对应路径。
 

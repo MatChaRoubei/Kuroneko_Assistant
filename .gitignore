@@ -40,3 +40,11 @@ debug_report.txt
 
 # Large prebuilt binary backup (not source)
 VoiceAssistant_backup_0302.exe
+
+# Private user data and generated audio
+userdata/
+long_term_memory.json
+reminders.json
+assistant_tts*.mp3
+*_models.tar.bz2
+*.part

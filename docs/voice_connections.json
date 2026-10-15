@@ -1,0 +1,17 @@
+{
+  "edge": {
+    "ok": false,
+    "message": "微软服务拒绝请求（HTTP 403）；当前在线声音不可用。",
+    "seconds": 2.78
+  },
+  "gptsovits": {
+    "ok": false,
+    "message": "GPT-SoVITS 本地服务未连接。助手只提供连接接口，不包含 GPT-SoVITS 服务和角色模型。请先启动 api_v2.py 服务。",
+    "seconds": 2.33
+  },
+  "vits": {
+    "ok": true,
+    "message": "本地自然语音合成成功，未播放。",
+    "seconds": 2.38
+  }
+}

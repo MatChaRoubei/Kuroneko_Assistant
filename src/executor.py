@@ -5,8 +5,91 @@ import threading
 import time
 import ctypes
 import sys
-import ollama
+from ollama import Client
+import httpx
+ollama = Client(timeout=httpx.Timeout(45, connect=3))
 import json
+import queue
+import copy
+from contextlib import contextmanager
+from src.storage import user_file, write_json
+_memory_revision = 0
+_maintenance_timer = None
+_memory_lock = threading.RLock()
+_model_slots = threading.BoundedSemaphore(2)
+
+
+def _chat_stream(**kwargs):
+    """Keep Stop responsive even while the server hasn't returned its first token.
+
+    Workers own their HTTP generators and only publish immutable chunks. A
+    bounded queue and two network slots prevent cancelled requests piling up.
+    """
+    from src.stop import STOP_REQUESTED
+    events = queue.Queue(maxsize=4)
+    cancelled = threading.Event()
+    finished = object()
+    kwargs = copy.deepcopy(kwargs)
+    kwargs.setdefault('think', False)
+    kwargs.setdefault('options', {'num_predict': 256, 'num_ctx': 4096})
+
+    def publish(value):
+        while not cancelled.is_set():
+            try:
+                events.put(value, timeout=0.05)
+                return
+            except queue.Full:
+                continue
+
+    def request():
+        acquired = False
+        response = None
+        try:
+            while not cancelled.is_set():
+                if _model_slots.acquire(timeout=0.05):
+                    acquired = True
+                    break
+            if not acquired or cancelled.is_set():
+                return
+            response = ollama.chat(**kwargs)
+            for chunk in response:
+                if cancelled.is_set():
+                    break
+                publish(chunk)
+        except Exception as exc:
+            publish(exc)
+        finally:
+            if response is not None and hasattr(response, 'close'):
+                response.close()
+            if acquired:
+                _model_slots.release()
+            publish(finished)
+
+    threading.Thread(target=request, daemon=True, name='model-stream').start()
+    last_chunk = time.monotonic()
+    started = last_chunk
+    last_notice = started
+    try:
+        while not STOP_REQUESTED.is_set():
+            try:
+                item = events.get(timeout=0.05)
+            except queue.Empty:
+                now = time.monotonic()
+                if now - last_notice >= 1:
+                    from src.gui import set_status
+                    set_status(f'正在组织回答… 已等待 {int(now - started)} 秒 · Esc 可停止')
+                    last_notice = now
+                if time.monotonic() - last_chunk > 20:
+                    raise TimeoutError('模型超过 20 秒未返回内容。请检查 Ollama，或在设置中选择更小的模型。')
+                continue
+            if item is finished:
+                return
+            if isinstance(item, Exception):
+                raise item
+            last_chunk = time.monotonic()
+            yield item
+    finally:
+        cancelled.set()
 
 chat_history = []
 _memory_file = None
@@ -38,36 +121,22 @@ def _ensure_system_prompt():
     global chat_history
     if not chat_history or chat_history[0].get('role') != 'system':
         chat_history.insert(0, {'role': 'system', 'content': SYSTEM_PROMPT})
+    from src.gui import _runtime
+    mark = '[声音表达偏好] '
+    chat_history[:] = [message for message in chat_history if not str(message.get('content', '')).startswith(mark)]
+    if _runtime.get('tts_engine') == 'gptsovits':
+        preference = '主要用自然中文回答，语气克制、优雅、略带傲娇，不要每句加喵。'
+        if _runtime.get('japanese_catchphrases', True):
+            preference += '可以偶尔加一句很短的日语口头禅，例如“ふん”或“仕方ないわね”，每次回复最多一句，大部分回复仍只用中文。'
+        chat_history.insert(1, {'role': 'system', 'content': mark + preference})
 
 
 def _get_memory_file():
-    """返回长期记忆文件路径：源码运行 -> 项目根；打包运行 -> exe 所在目录"""
-    global _memory_file
-    if _memory_file:
-        return _memory_file
-    if getattr(sys, 'frozen', False):
-        base = os.path.dirname(os.path.abspath(sys.executable))
-    else:
-        try:
-            from .config import get_resource_root
-        except ImportError:
-            from config import get_resource_root
-        base = get_resource_root()
-    _memory_file = os.path.join(base, 'chat_memory.json')
-    return _memory_file
+    return user_file('chat_memory.json')
 
 
 def _get_long_term_file():
-    """返回长期记忆库（结构化事实）文件路径，与对话历史同目录"""
-    if getattr(sys, 'frozen', False):
-        base = os.path.dirname(os.path.abspath(sys.executable))
-    else:
-        try:
-            from .config import get_resource_root
-        except ImportError:
-            from config import get_resource_root
-        base = get_resource_root()
-    return os.path.join(base, 'long_term_memory.json')
+    return user_file('long_term_memory.json')
 
 
 # ---------- 长期记忆库（GPT 式跨会话事实库，每轮轻量抽取） ----------
@@ -90,8 +159,7 @@ def load_long_term_memory():
 def save_long_term_memory(facts):
     """写入长期记忆库"""
     try:
-        with open(_get_long_term_file(), 'w', encoding='utf-8') as f:
-            json.dump({'facts': facts}, f, ensure_ascii=False, indent=2, default=str)
+        write_json(_get_long_term_file(), {'facts': facts})
     except (OSError, IOError) as e:
         print(f'[长期记忆] 保存失败: {e}')
 
@@ -109,7 +177,7 @@ def _render_long_term_prompt(facts):
     return '\n'.join(lines)
 
 
-def _update_long_term_memory(recent_messages):
+def _update_long_term_memory(recent_messages, revision=None):
     """每轮轻量抽取：把最近若干轮对话交给本地模型，抽取值得长期记住的事实并 upsert。
 
     recent_messages: 本次新增的对话消息（user/assistant）。
@@ -178,7 +246,10 @@ def _update_long_term_memory(recent_messages):
                 by_key[k] = rec
                 added += 1
         if added or any(f.get('updated') == now for f in facts):
-            save_long_term_memory(facts)
+            with _memory_lock:
+                if revision is not None and revision != _memory_revision:
+                    return
+                save_long_term_memory(facts)
             if added:
                 print(f'[长期记忆] 新增/更新 {added} 条事实，当前共 {len(facts)} 条')
     except Exception as e:
@@ -225,16 +296,15 @@ def save_chat_history():
         persistent = [m for m in chat_history
                       if not (isinstance(m, dict) and m.get('role') == 'system'
                               and str(m.get('content', '')).startswith(_LT_MARK))]
-        with open(_get_memory_file(), 'w', encoding='utf-8') as f:
-            # default=str 兜底：即使混入不可序列化对象也不会崩溃
-            json.dump(persistent, f, ensure_ascii=False, indent=2, default=str)
+        write_json(_get_memory_file(), persistent)
     except (OSError, IOError) as e:
         print(f'保存记忆失败: {e}')
 
 
 def clear_chat_history():
     """清空长期记忆（对话历史 + 长期事实库一并清空）"""
-    global chat_history
+    global chat_history, _memory_revision
+    _memory_revision += 1
     chat_history = []
     try:
         os.remove(_get_memory_file())
@@ -376,11 +446,13 @@ def compact_history():
     global chat_history
     if len(chat_history) <= _HISTORY_COMPACT_THRESHOLD:
         return
-    existing_summary = _extract_existing_summary(chat_history)
+    snapshot = list(chat_history)
+    revision = _memory_revision
+    existing_summary = _extract_existing_summary(snapshot)
     # 找到第一个非摘要 system 之外的、需要压缩的旧消息边界
     # 保留最近 _HISTORY_KEEP_RECENT 条，其余（除已有摘要 system）进压缩集
-    recent = chat_history[-_HISTORY_KEEP_RECENT:]
-    old = chat_history[:-_HISTORY_KEEP_RECENT]
+    recent = snapshot[-_HISTORY_KEEP_RECENT:]
+    old = snapshot[:-_HISTORY_KEEP_RECENT]
     # 已有摘要本身不算旧对话，从 old 中剔除，避免重复压缩
     old_for_model = [m for m in old
                      if not (isinstance(m, dict) and m.get('role') == 'system'
@@ -395,8 +467,32 @@ def compact_history():
     # 组装：新摘要 + 最近保留的轮次；若 recent 里已有系统人设提示则保留在首位
     system_prompts = [m for m in recent if isinstance(m, dict) and m.get('role') == 'system']
     others = [m for m in recent if not (isinstance(m, dict) and m.get('role') == 'system')]
-    chat_history = system_prompts + [new_summary_msg] + others
+    with _memory_lock:
+        if revision != _memory_revision:
+            return
+        chat_history = system_prompts + [new_summary_msg] + others
+        _ensure_system_prompt()
+        save_chat_history()
     print('[记忆] 已压缩历史为摘要，保留最近 %d 轮' % _HISTORY_KEEP_RECENT)
+
+
+def _schedule_memory_maintenance():
+    global _maintenance_timer
+    if _maintenance_timer is not None:
+        _maintenance_timer.cancel()
+    snapshot = list(chat_history)
+    revision = _memory_revision
+    def maintain():
+        from src.lifecycle import busy, shutdown
+        if shutdown.is_set() or busy.is_set() or revision != _memory_revision:
+            return
+        _update_long_term_memory(snapshot, revision)
+        if revision == _memory_revision and not busy.is_set():
+            compact_history()
+    _maintenance_timer = threading.Timer(20, maintain)
+    _maintenance_timer.daemon = True
+    _maintenance_timer.start()
+
 
 DEFAULT_APP_MAP = {
     # 系统工具
@@ -413,7 +509,7 @@ DEFAULT_APP_MAP = {
     'powershell': 'powershell.exe',
 
     # 浏览器
-    '浏览器': 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+    '浏览器': 'start https://www.bing.com',
     'chrome': 'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
     '谷歌浏览器': 'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
     'googlechrome': 'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
@@ -575,7 +671,7 @@ def load_app_map(path=None):
         if isinstance(user_map, dict):
             for k, v in user_map.items():
                 if isinstance(k, str) and isinstance(v, str):
-                    APP_MAP[k.strip().lower()] = v
+                    APP_MAP[k.strip().lower()] = os.path.expandvars(os.path.expanduser(v))
     except Exception:
         pass
 
@@ -634,7 +730,6 @@ def scan_standard_windows_program_files(refresh_map=True):
 def scan_all_program_folders():
     """扫描本地 AppData 和两大 Program Files 目录，并合并到 APP_MAP。"""
     print("Loading app map...")
-    load_app_map()
     print("App map loaded")
     mapped = []
     # 只扫描 Local\Programs 在启动时，Program Files 太大
@@ -686,7 +781,7 @@ def resolve_app_executable(app_name):
 
     # 模糊匹配映射表关键词（优先精确、短名）
     candidate = None
-    for key, value in APP_MAP.items():
+    for key, value in list(APP_MAP.items()):
         if not key or not value:
             continue
 
@@ -697,7 +792,7 @@ def resolve_app_executable(app_name):
             break
 
     if not candidate:
-        for key, value in APP_MAP.items():
+        for key, value in list(APP_MAP.items()):
             if normalized in key.split() or key in normalized.split():
                 if os.path.exists(value) or shutil.which(value):
                     return value
@@ -800,38 +895,105 @@ def close_app(app_name):
     if not app_name:
         return False, '没有指定要关闭的应用'
     # 去除 .exe 后缀，避免 taskkill /im xxx.exe.exe
-    app_base = app_name.rstrip('.exe').strip()
+    resolved = resolve_app_executable(app_name)
+    app_base = os.path.basename(resolved or app_name).removesuffix('.exe').strip()
+    if not app_base or any(char in app_base for char in '\\/\"<>|*?'):
+        return False, '应用名称无效'
     try:
-        subprocess.Popen(f'taskkill /im {app_base}.exe /f', shell=True)
+        subprocess.Popen(['taskkill', '/im', f'{app_base}.exe', '/f'], creationflags=0x08000000)
         return True, f'已尝试关闭{app_base}'
     except Exception as e:
         return False, f'关闭{app_base}失败：{e}'
+
+
+@contextmanager
+def _audio_endpoint():
+    import pythoncom
+    pythoncom.CoInitialize()
+    try:
+        from pycaw.pycaw import AudioUtilities
+        yield AudioUtilities.GetSpeakers().EndpointVolume
+    finally:
+        pythoncom.CoUninitialize()
 
 
 def set_volume(value):
     try:
         value = int(value)
     except (ValueError, TypeError):
-        value = 50
+        return False, '请说明音量数值，例如“音量调到百分之五十”。'
     value = max(0, min(100, value))
     try:
-        from pycaw.pycaw import AudioUtilities
-        devices = AudioUtilities.GetSpeakers()
-        volume = devices.EndpointVolume
-        volume.SetMasterVolumeLevelScalar(value / 100.0, None)
+        with _audio_endpoint() as volume:
+            volume.SetMasterVolumeLevelScalar(value / 100.0, None)
         return True, f'已将音量设置为 {value}%'
     except Exception as e:
-        return True, f'请求设置音量到 {value}%'
+        return False, f'音量设置失败：{e}'
+
+
+def control_volume(action, value=None):
+    try:
+        with _audio_endpoint() as endpoint:
+            if action == 'read':
+                return True, f'当前音量为 {round(endpoint.GetMasterVolumeLevelScalar() * 100)}%，' + ('已静音。' if endpoint.GetMute() else '未静音。')
+            if action == 'mute':
+                endpoint.SetMute(bool(value), None)
+                return True, '已静音。' if value else '已取消静音。'
+            target = max(0, min(100, round(endpoint.GetMasterVolumeLevelScalar() * 100) + int(value)))
+            endpoint.SetMasterVolumeLevelScalar(target / 100, None)
+            return True, f'已将音量调整为 {target}%。'
+    except Exception as exc:
+        return False, f'音量操作失败：{exc}'
+
+
+def media_control(action):
+    if sys.platform != 'win32':
+        return False, '媒体控制仅支持 Windows。'
+    keys = {'play_pause': 0xB3, 'next_track': 0xB0, 'previous_track': 0xB1}
+    if action not in keys:
+        return False, '不支持的媒体操作。'
+    try:
+        user32 = ctypes.windll.user32
+        user32.keybd_event(keys[action], 0, 0, 0)
+        user32.keybd_event(keys[action], 0, 2, 0)
+        label = {'play_pause': '播放/暂停切换', 'next_track': '下一首', 'previous_track': '上一首'}[action]
+        return True, f'已发送{label}指令，需要播放器支持 Windows 媒体键。'
+    except Exception as exc:
+        return False, f'媒体指令发送失败：{exc}'
+
+
+def window_control(action):
+    if sys.platform != 'win32':
+        return False, '窗口控制仅支持 Windows。'
+    try:
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        handle = user32.GetForegroundWindow()
+        if not handle:
+            return False, '没有找到前台窗口。'
+        if action == 'close':
+            if not user32.PostMessageW(handle, 0x0010, 0, 0):
+                return False, '无法向当前窗口发送关闭请求。'
+            return True, '已请求关闭当前窗口；如有未保存内容，请处理应用弹出的提示。'
+        states = {'minimize': 6, 'maximize': 3, 'restore': 9}
+        if action not in states:
+            return False, '不支持的窗口操作。'
+        user32.ShowWindow(handle, states[action])
+        return True, '已向当前前台窗口发送' + {'minimize': '最小化', 'maximize': '最大化', 'restore': '还原'}[action] + '指令。'
+    except Exception as exc:
+        return False, f'窗口操作失败：{exc}'
 
 
 def set_timer(minutes):
-    def _alarm():
-        time.sleep(minutes * 60)
-        print('定时提醒：时间到！')
-
-    thread = threading.Thread(target=_alarm, daemon=True)
-    thread.start()
-    return True, f'已设置 {minutes} 分钟定时提醒'
+    from src.reminders import get_reminders
+    try:
+        seconds = float(minutes) * 60
+    except (TypeError, ValueError):
+        return False, '请说明提醒时长，例如“定时五分钟”。'
+    return get_reminders().add(seconds)
 
 
 def save_to_folder(folder=None, filepath=None, content=''):
@@ -903,9 +1065,21 @@ def get_ollama_model():
     if _ollama_model_cache and now - _ollama_model_cache_t < _ollama_model_cache_ttl:
         return _ollama_model_cache
     try:
-        models = ollama.list()
+        models = Client(timeout=3).list()
         names = [m.model for m in (models.models or [])]
         if names:
+            # Avoid choosing a 24B model just because it appears first in the
+            # list. Prefer an already loaded conversational model that fits.
+            sizes = {m.model: (m.size or 0) for m in models.models}
+            candidates = [name for name in names if 'deepseek-r1' not in name.lower() and sizes[name] <= 8 * 1024 ** 3]
+            if candidates:
+                try:
+                    loaded = {m.model for m in Client(timeout=2).ps().models}
+                except Exception:
+                    loaded = set()
+                preferred = min(candidates, key=lambda name: (name not in loaded, 'qwen' not in name.lower(), sizes[name]))
+                _ollama_model_cache, _ollama_model_cache_t = preferred, now
+                return preferred
             # 优先非推理模型，deepseek-r1 这类推理模型放最后
             for n in names:
                 if 'deepseek-r1' in n.lower():
@@ -918,7 +1092,7 @@ def get_ollama_model():
             return names[0]
     except Exception:
         pass
-    return 'deepseek-r1:7b'
+    raise RuntimeError('未检测到 Ollama 模型。请启动 Ollama 并安装模型，再到设置中刷新；系统指令仍可正常使用。')
 
 
 # AI agent 可用工具定义（Ollama function calling 格式）
@@ -1006,7 +1180,7 @@ def _search_web(query, max_results=5):
     try:
         from ddgs import DDGS
         results = []
-        with DDGS() as ddgs:
+        with DDGS(timeout=5) as ddgs:
             for r in ddgs.text(query, max_results=max_results):
                 title = (r.get('title') or '').strip()
                 body = (r.get('body') or '').strip()[:150]
@@ -1147,7 +1321,10 @@ def _flush_stream(text_buffer):
 
 def _run_ai_agent(user_input):
     """AI agent：通过 function calling 让模型自主调用工具"""
+    global _memory_revision
+    _memory_revision += 1
     load_chat_history()
+    _ensure_system_prompt()
     chat_history.append({'role': 'user', 'content': user_input})
     try:
         return _agent_loop()
@@ -1155,6 +1332,11 @@ def _run_ai_agent(user_input):
         # 模型不支持 function calling 等情况，回退到普通流式聊天
         print(f'[Agent] function calling 不可用，回退普通聊天: {e}')
         # 回退前清理历史中可能残留的工具调用消息，避免二次序列化失败
+        from src.stop import is_stop_requested
+        if is_stop_requested():
+            return True, '（已停止）', True
+        if 'tool' not in str(e).lower() or 'support' not in str(e).lower():
+            raise
         _sanitize_history()
         return _stream_chat()
 
@@ -1174,7 +1356,7 @@ def _agent_loop():
             break
 
         # 仅最后一轮（无工具调用、有正文）才走流式播报；中间轮工具调用不播
-        response = ollama.chat(
+        response = _chat_stream(
             model=get_ollama_model(),
             messages=chat_history,
             tools=TOOLS,
@@ -1184,9 +1366,14 @@ def _agent_loop():
         content_parts = []
         tool_calls_raw = None
         for chunk in response:
+            if STOP_REQUESTED.is_set():
+                response.close()
+                return True, ''.join(content_parts).strip() + '\n（已停止）', True
             msg = chunk.get('message', {})
             piece = msg.get('content', '') or ''
             if piece:
+                from src.gui import stream_output
+                stream_output(piece)
                 content_parts.append(piece)
                 text_buffer['buf'] += piece
                 if _stream_say(text_buffer):
@@ -1196,12 +1383,17 @@ def _agent_loop():
             if tc:
                 tool_calls_raw = tc
 
+        response.close()
+        if STOP_REQUESTED.is_set():
+            return True, ''.join(content_parts).strip() + '\n（已停止）', True
         raw_content = ''.join(content_parts).strip()
         # 归一化 tool_calls（可能是 pydantic 对象）
         tool_calls = _to_plain(tool_calls_raw or [])
 
         if not tool_calls:
-            reply = raw_content or '（无回复）'
+            if not raw_content:
+                raise RuntimeError('模型返回了空回答。请在设置中更换模型后重试。')
+            reply = raw_content
             chat_history.append({'role': 'assistant', 'content': reply})
             break
 
@@ -1217,6 +1409,8 @@ def _agent_loop():
         MAX_TOOL_FAILS = 3
         fail_streak = 0
         for tc in tool_calls:
+            if STOP_REQUESTED.is_set():
+                return True, '（已停止）', True
             fn = tc.get('function', {}) if isinstance(tc, dict) else {}
             name = fn.get('name', '')
             args = fn.get('arguments', {})
@@ -1253,15 +1447,8 @@ def _agent_loop():
     if _flush_stream(text_buffer):
         streamed = True
 
-    # 每轮轻量抽取长期事实（GPT 式长期记忆），失败不影响对话
-    try:
-        _update_long_term_memory(chat_history)
-    except Exception as e:
-        print(f'[长期记忆] 抽取调用异常（已忽略）: {e}')
-
-    # 历史过长时压缩为摘要（增量），避免暴力截断丢失人设与长期记忆
-    compact_history()
     save_chat_history()
+    _schedule_memory_maintenance()
     return True, reply, streamed
 
 
@@ -1272,12 +1459,15 @@ def _stream_chat():
     full_reply = ''
     text_buffer = {'buf': ''}
     streamed = False
-    for chunk in ollama.chat(
+    response = _chat_stream(
         model=get_ollama_model(),
         messages=chat_history,
         stream=True
-    ):
+    )
+    for chunk in response:
         piece = chunk.get('message', {}).get('content', '') or ''
+        from src.gui import stream_output
+        stream_output(piece)
         full_reply += piece
         text_buffer['buf'] += piece
         if _stream_say(text_buffer):
@@ -1285,12 +1475,14 @@ def _stream_chat():
         if STOP_REQUESTED.is_set():
             full_reply = full_reply.strip() + '\n（已停止）'
             break
+    response.close()
+    if STOP_REQUESTED.is_set():
+        return True, full_reply.strip() + '\n（已停止）', True
     reply = full_reply.strip() or '（无回复）'
     if _flush_stream(text_buffer):
         streamed = True
     chat_history.append({'role': 'assistant', 'content': reply})
-    if len(chat_history) > 20:
-        chat_history = chat_history[-20:]
+    _schedule_memory_maintenance()
     save_chat_history()
     return True, reply, streamed
 
@@ -1329,15 +1521,38 @@ def cleanup_space():
 
 
 def execute_intent(intent_name, slots, raw_text=''):
-    global chat_history
+    global chat_history, _memory_revision
+    _memory_revision += 1
     if intent_name == 'open_app':
         return open_app(slots.get('app_name', ''))
     if intent_name == 'close_app':
         return close_app(slots.get('app_name', ''))
     if intent_name == 'set_volume':
-        return set_volume(slots.get('value', 50))
+        return set_volume(slots.get('value'))
+    if intent_name in ('get_volume', 'adjust_volume', 'mute_volume'):
+        return control_volume({'get_volume': 'read', 'adjust_volume': 'adjust', 'mute_volume': 'mute'}[intent_name],
+                              slots.get('delta') if intent_name == 'adjust_volume' else slots.get('muted'))
+    if intent_name == 'media_control':
+        return media_control(slots.get('action'))
+    if intent_name == 'window_control':
+        return window_control(slots.get('action'))
     if intent_name == 'set_timer':
-        return set_timer(slots.get('minutes', 10))
+        if 'seconds' in slots:
+            from src.reminders import get_reminders
+            return get_reminders().add(slots['seconds'], slots.get('content'))
+        return set_timer(slots.get('minutes'))
+    if intent_name in ('list_reminders', 'cancel_reminder'):
+        from src.reminders import get_reminders
+        manager = get_reminders()
+        return manager.describe() if intent_name == 'list_reminders' else manager.cancel(slots.get('target', 'latest'))
+    if intent_name == 'show_help':
+        return True, '可以说：五分钟后提醒我喝水、查看提醒、取消最后一个提醒、音量大一点、取消静音、下一首、打开记事本、现在几点。点击“说一句”可不用唤醒词直接说话，按 F8 也可以。'
+    if intent_name == 'cancel_shutdown':
+        try:
+            subprocess.run(['shutdown', '/a'], check=True, creationflags=0x08000000, capture_output=True)
+            return True, '已取消 Windows 关机或重启计划。'
+        except Exception:
+            return False, '没有可取消的关机计划，或 Windows 未允许取消。'
     if intent_name == 'save_to_folder':
         return save_to_folder(
             folder=slots.get('folder'),
@@ -1422,7 +1637,7 @@ def system_shutdown():
     if not _is_windows():
         return False, '仅支持 Windows 系统'
     try:
-        os.system('shutdown /s /t 30')
+        subprocess.run(['shutdown', '/s', '/t', '30'], check=True, creationflags=0x08000000)
         return True, '系统将在 30 秒后关机'
     except Exception as e:
         return False, f'关机失败: {e}'
@@ -1433,7 +1648,7 @@ def system_reboot():
     if not _is_windows():
         return False, '仅支持 Windows 系统'
     try:
-        os.system('shutdown /r /t 30')
+        subprocess.run(['shutdown', '/r', '/t', '30'], check=True, creationflags=0x08000000)
         return True, '系统将在 30 秒后重启'
     except Exception as e:
         return False, f'重启失败: {e}'
@@ -1471,15 +1686,8 @@ def system_sleep():
 
 
 def confirm_action():
-    """请求用户确认（用于危险操作）"""
-    # windowed（无控制台）模式下无法 input 确认，语音指令已表明意图，直接放行
-    if sys.stdin is None:
-        return True
-    try:
-        confirm = input('确定要执行此操作吗？(y/n)：').strip().lower()
-        return confirm in ('y', 'yes', '是', '确认')
-    except (EOFError, KeyboardInterrupt):
-        return False
+    from src.gui import ask_confirmation
+    return ask_confirmation('即将执行关机、重启或睡眠操作。是否继续？')
 
 
 # 系统面板命令映射表
@@ -1505,7 +1713,7 @@ SYSTEM_PANEL_COMMANDS = {
     '截图': 'snippingtool',
     '截屏': 'snippingtool',
     '清空回收站': 'powershell -Command "Clear-RecycleBin -Force"',
-    '浏览器': 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+    '浏览器': 'start https://www.bing.com',
 }
 
 

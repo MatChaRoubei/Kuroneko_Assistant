@@ -8,16 +8,115 @@ import wave
 import numpy as np
 import sounddevice as sd
 import speech_recognition as sr
+import threading
+from functools import wraps
+from collections import deque
+from src.lifecycle import capture_should_stop as _capture_should_stop
+
+capture_lock = threading.RLock()
+capture_context = threading.local()
 
 
-def check_speech_dependencies():
+def capture_should_stop():
+    cancelled = getattr(capture_context, 'cancelled', None)
+    if getattr(capture_context, 'manual', False):
+        from src.lifecycle import shutdown, capture_cancelled
+        stopped = shutdown.is_set() or capture_cancelled.is_set()
+    else:
+        stopped = _capture_should_stop()
+    return stopped or (cancelled is not None and cancelled())
+
+
+def owns_microphone(method):
+    @wraps(method)
+    def guarded(*args, **kwargs):
+        with capture_lock:
+            if capture_should_stop():
+                return False, '监听已取消'
+            return method(*args, **kwargs)
+    return guarded
+
+
+def listen_for_wake(recognizer, wake_words, on_wake=None, sensitivity=0.8):
+    """Decode at speech endpoints; retain a short prefix and skip silence."""
+    mic = recognizer.microphone
+    if getattr(mic, 'neural_endpoint', False) is True:
+        utterances = mic.iter_utterances()
+        command = None
+        try:
+            for wav in utterances:
+                from src.gui import set_status
+                set_status('正在识别语音…')
+                ok, text = recognizer._recognize_wav(wav)
+                if capture_should_stop():
+                    return False, '监听已取消'
+                if ok:
+                    found, remaining = match_wake_word(text, wake_words, threshold=sensitivity)
+                    if not wake_words or found:
+                        command = remaining if wake_words else text
+                        break
+                set_status('监听中 · 请说唤醒词和指令')
+            else:
+                return False, '监听已取消'
+        finally:
+            utterances.close()
+        if command:
+            return True, command
+        if on_wake:
+            on_wake()
+        return recognizer.listen_once(timeout=5, phrase_time_limit=15)
+    chunks = deque(maxlen=60)
+    prefix = deque(maxlen=3)
+    quiet = 0
+    speaking = False
+    command = None
+    try:
+        for block in mic.iter_blocks(0.1):
+            if capture_should_stop():
+                return False, '监听已取消'
+            rms = float(np.sqrt(np.mean(block ** 2)))
+            if not speaking:
+                prefix.append(block)
+                if rms <= mic.energy_threshold:
+                    continue
+                chunks.extend(prefix)
+                prefix.clear()
+                speaking = True
+            else:
+                chunks.append(block)
+            quiet = quiet + 1 if rms <= mic.energy_threshold else 0
+            if quiet < 6 and len(chunks) < 60:
+                continue
+            ok, text = recognizer._recognize_wav(_block_to_wav(np.concatenate(chunks), mic.sample_rate))
+            chunks.clear()
+            speaking, quiet = False, 0
+            if capture_should_stop():
+                return False, '监听已取消'
+            if ok:
+                found, remaining = match_wake_word(text, wake_words, threshold=sensitivity)
+                if not wake_words or found:
+                    command = remaining if wake_words else text
+                    break
+        else:
+            return False, '录音已结束'
+    except Exception as exc:
+        return False, f'录音失败: {exc}'
+    # The input stream has closed before acknowledgement or follow-up recording.
+    if command:
+        return True, command
+    if on_wake:
+        on_wake()
+    return recognizer.listen_once(timeout=5, phrase_time_limit=10)
+
+
+def check_speech_dependencies(device=None):
     """检查语音依赖是否满足"""
     try:
         devices = sd.query_devices()
         input_devices = [d for d in devices if d['max_input_channels'] > 0]
         if not input_devices:
             return False, '检测不到麦克风设备，请插入麦克风或检查系统设置'
-        default_input = sd.query_devices(kind='input')
+        default_input = sd.query_devices(device, kind='input') if device is not None else sd.query_devices(kind='input')
         return True, f'检测到麦克风：{default_input["name"]}，采样率 {int(default_input["default_samplerate"])}Hz'
     except Exception as e:
         return False, f'音频设备检测失败: {e}'
@@ -34,6 +133,26 @@ def list_microphones():
         return mics
     except Exception:
         return []
+
+
+def microphone_choices():
+    apis = sd.query_hostapis()
+    return {f'{item["name"]} · {apis[item["hostapi"]]["name"]}':
+            {'name': item['name'], 'hostapi': apis[item['hostapi']]['name']}
+            for item in sd.query_devices() if item['max_input_channels'] > 0}
+
+
+def resolve_microphone(selection):
+    if not selection:
+        return None
+    choices = microphone_choices()
+    if selection not in choices.values():
+        raise RuntimeError('所选麦克风已断开。请连接设备，或在设置的“语音输入”页改选麦克风。')
+    apis = sd.query_hostapis()
+    for index, item in enumerate(sd.query_devices()):
+        if item['max_input_channels'] > 0 and item['name'] == selection['name'] and apis[item['hostapi']]['name'] == selection['hostapi']:
+            return index
+    raise RuntimeError('所选麦克风不可用。')
 
 
 class SounddeviceMicrophone:
@@ -58,6 +177,19 @@ class SounddeviceMicrophone:
             dev_info = sd.query_devices(kind='input')
         self.sample_rate = int(dev_info['default_samplerate'])
         self.channels = int(dev_info['max_input_channels'])
+        try:
+            sd.check_input_settings(device=self.device, channels=1, dtype='float32', samplerate=16000)
+            self.sample_rate = 16000
+        except Exception:
+            pass
+        self.endpoint = None
+        self.neural_endpoint = False
+        try:
+            from src.endpoint import SpeechEndpoint
+            self.endpoint = SpeechEndpoint()
+            self.neural_endpoint = True
+        except Exception as exc:
+            print(f'[语音端点] 神经检测不可用，使用能量检测: {exc}')
 
     def __enter__(self):
         return self
@@ -108,9 +240,18 @@ class SounddeviceMicrophone:
         except Exception as e:
             return False, f'录音失败: {e}'
 
-    def listen_until_silence(self, max_duration=15.0, silence_duration=1.2,
-                             energy_threshold=None):
+    def listen_until_silence(self, max_duration=15.0, silence_duration=0.6,
+                             energy_threshold=None, timeout=5):
         """持续录音：检测到语音开始后，直到静音结束。返回 (success, wav_bytes or error)"""
+        if self.neural_endpoint:
+            utterances = self.iter_utterances(timeout=timeout, max_duration=max_duration)
+            try:
+                wav = next(utterances, None)
+                return (True, wav) if wav is not None else (False, '监听已取消' if capture_should_stop() else '未检测到语音')
+            except Exception as exc:
+                return False, f'录音失败: {exc}'
+            finally:
+                utterances.close()
         import time as _time
         if energy_threshold is None:
             energy_threshold = self.energy_threshold
@@ -122,11 +263,15 @@ class SounddeviceMicrophone:
         speech_started = False
         silence_accum = 0.0
         total = 0.0
+        prefix = deque(maxlen=3)
+        speech_duration = 0.0
 
         try:
             with sd.InputStream(samplerate=rate, channels=1, dtype='float32',
                                 device=self.device, blocksize=block) as stream:
                 while True:
+                    if capture_should_stop():
+                        return False, '监听已取消'
                     data, _ = stream.read(block)
                     mono = data[:, 0]
                     energy = float(np.sqrt(np.mean(mono.astype(np.float64) ** 2)))
@@ -134,6 +279,7 @@ class SounddeviceMicrophone:
                     if energy > energy_threshold:
                         if not speech_started:
                             speech_started = True
+                            audio_chunks.extend(prefix)
                             print('[监听] 检测到语音，开始录音...')
                         silence_accum = 0.0
                         audio_chunks.append(data)
@@ -143,9 +289,13 @@ class SounddeviceMicrophone:
                         if silence_accum >= silence_duration:
                             print('[监听] 检测到静音，录音结束')
                             break
+                    else:
+                        prefix.append(data)
 
                     total += block / rate
-                    if total >= max_duration:
+                    if speech_started:
+                        speech_duration += block / rate
+                    if speech_duration >= max_duration or (not speech_started and total >= timeout):
                         break
         except sd.PortAudioError as e:
             return False, f'录音失败（PortAudio）: {e}'
@@ -167,6 +317,38 @@ class SounddeviceMicrophone:
             wf.setframerate(rate)
             wf.writeframes(audio_int16.tobytes())
         return True, wav_buffer.getvalue()
+
+    def iter_utterances(self, timeout=None, max_duration=20):
+        """Yield complete speech after a neural endpoint, without fixed windows."""
+        self.endpoint.reset()
+        blocks = self.iter_blocks(0.032)
+        waited = spoken = 0
+        was_speaking = False
+        try:
+            for block in blocks:
+                if capture_should_stop():
+                    return
+                self.endpoint.accept(block, self.sample_rate)
+                duration = len(block) / self.sample_rate
+                if self.endpoint.speaking:
+                    spoken += duration
+                    if not was_speaking:
+                        from src.gui import set_status
+                        set_status('正在听你说话…')
+                    was_speaking = True
+                else:
+                    waited += duration
+                if spoken >= max_duration:
+                    self.endpoint.detector.flush()
+                samples = self.endpoint.pop()
+                if samples is not None:
+                    yield _block_to_wav(samples, 16000)
+                    spoken = waited = 0
+                    was_speaking = False
+                if timeout is not None and not was_speaking and waited >= timeout:
+                    return
+        finally:
+            blocks.close()
 
     def record_fixed(self, duration=3.0):
         """固定时长录音（不依赖能量阈值），返回 (success, wav_bytes or error)。
@@ -204,6 +386,8 @@ class SounddeviceMicrophone:
             with sd.InputStream(samplerate=rate, channels=1, dtype='float32',
                                 device=self.device, blocksize=block) as stream:
                 while True:
+                    if capture_should_stop():
+                        return
                     data, _ = stream.read(block)
                     yield data[:, 0]
         except sd.PortAudioError as e:
@@ -291,15 +475,14 @@ def _match_one(text, word, threshold=0.8):
                 return True, remaining
 
     # 3) 字符级模糊兜底（缺字/部分识别错误；两字词放宽阈值，避免永远命中不了）
-    eff_threshold = threshold
-    if len(word_l) <= 2:
-        eff_threshold = min(threshold, 0.6)
-    wake_prefix = word_l[:max(2, len(word_l) - 2)]
-    for i in range(len(text_l) - len(wake_prefix) + 1):
-        chunk = text_l[i:i + len(wake_prefix) + 2]
+    if len(word_l) <= 2 or len(text_l) < len(word_l):
+        return False, text
+    eff_threshold = max(threshold, 0.75)
+    for i in range(len(text_l) - len(word_l) + 1):
+        chunk = text_l[i:i + len(word_l)]
         ratio = SequenceMatcher(None, word_l, chunk).ratio()
         if ratio >= eff_threshold:
-            remaining = (text_l[:i] + ' ' + text_l[i + len(wake_prefix) + 2:]).strip()
+            remaining = (text_l[:i] + ' ' + text_l[i + len(word_l):]).strip()
             return True, remaining
 
     return False, text
@@ -338,26 +521,37 @@ def match_phrase(text, phrases, threshold=0.8):
     return False, None
 
 
+def is_stop_command(text, phrases):
+    import re
+    text = re.sub(r'^(?:请|帮我)', '', text.strip()).strip(' 。！!吧')
+    return any(len(text) <= len(phrase) + 1 and match_phrase(text, [phrase])[0] for phrase in phrases)
+
+
 class SpeechRecognizer:
     """
     语音识别器，支持中文识别
     使用 sounddevice 采集 + Google 语音识别
     """
-    def __init__(self, language='zh-CN'):
-        ok, msg = check_speech_dependencies()
+    def __init__(self, language='zh-CN', device=None, energy_threshold=0.02):
+        ok, msg = check_speech_dependencies(device)
         if not ok:
             raise RuntimeError(msg)
         self.recognizer = sr.Recognizer()
+        self.recognizer.operation_timeout = 5
         self.language = language
-        self.microphone = SounddeviceMicrophone()
+        self.microphone = SounddeviceMicrophone(device=device, energy_threshold=energy_threshold)
 
-    def _recognize_with_retry(self, audio, retries=3, delay=1):
+    def _recognize_with_retry(self, audio, retries=1, delay=1):
         """带重试的语音识别，处理网络连接错误"""
         import time
         last_error = None
         for attempt in range(retries):
+            if capture_should_stop():
+                return False, '监听已取消'
             try:
                 text = self.recognizer.recognize_google(audio, language=self.language)
+                if capture_should_stop():
+                    return False, '监听已取消'
                 return True, text
             except Exception as e:
                 last_error = e
@@ -385,6 +579,7 @@ class SpeechRecognizer:
         except Exception as e:
             return False, f'识别失败: {e}'
 
+    @owns_microphone
     def listen_once(self, timeout=5, phrase_time_limit=8):
         """
         录制并识别一段语音，返回 (success, text or error_message)。
@@ -392,7 +587,7 @@ class SpeechRecognizer:
         改用 VAD 端点检测（listen_until_silence）代替固定时长录音：用户说完即停。
         """
         ok, audio_or_error = self.microphone.listen_until_silence(
-            max_duration=phrase_time_limit, silence_duration=1.0
+            max_duration=phrase_time_limit, silence_duration=0.6, timeout=timeout
         )
         if not ok:
             return False, audio_or_error
@@ -417,48 +612,12 @@ class SpeechRecognizer:
         except Exception as e:
             return False, f'识别失败: {e}'
 
-    def listen_with_wake_word(self, wake_words=None, retries=2):
-        """持续监听：检测语音 -> 录音到静音 -> 识别 -> 检查唤醒词。
-        唤醒后进入聆听状态，直到用户说完指令。"""
-        if wake_words is None:
-            wake_words = []
+    @owns_microphone
+    def listen_with_wake_word(self, wake_words=None, on_wake=None, sensitivity=0.8):
+        return listen_for_wake(self, wake_words or [], on_wake, sensitivity)
 
-        while True:
-            ok, wav = self.microphone.listen_until_silence()
-            if not ok:
-                print(f'[监听] {wav}')
-                continue
-
-            ok, text = self._recognize_wav(wav)
-            if not ok:
-                print(f'[监听] {text}')
-                continue
-
-            normalized = text.lower().strip()
-            print(f'[调试] 识别结果: [{text}] -> normalized: [{normalized}]')
-
-            if not wake_words:
-                return True, normalized
-
-            # 复用共享的 match_wake_word（精确 + 模糊），避免与模块函数重复实现
-            found_wake, remaining = match_wake_word(normalized, wake_words, threshold=0.8)
-            if not found_wake:
-                print('未检测到唤醒词，继续监听...')
-                continue
-
-            if remaining:
-                # 唤醒词 + 指令一起说
-                return True, remaining
-
-            # 只说唤醒词：进入聆听状态，等用户说指令
-            print('已唤醒，请说出指令...')
-            ok, wav2 = self.microphone.listen_until_silence()
-            if not ok:
-                continue
-            ok, text2 = self._recognize_wav(wav2)
-            if not ok:
-                continue
-            return True, text2.strip()
+    def listen_with_kws(self, keywords=None, on_wake=None, sensitivity=0.8):
+        return self.listen_with_wake_word(keywords, on_wake, sensitivity)
 
     def listen_await_wake_word(self, wake_word_detector=None, timeout=60):
         """
@@ -521,7 +680,7 @@ class SherpaONNXRecognizer:
 
     _instance = None  # 类级别缓存，避免重复加载模型
 
-    def __init__(self, model_path='models/sense_voice', num_threads=2, energy_threshold=0.02):
+    def __init__(self, model_path='models/sense_voice', num_threads=2, energy_threshold=0.02, device=None):
         """
         初始化 sherpa-onnx 识别器
 
@@ -529,7 +688,7 @@ class SherpaONNXRecognizer:
             model_path: 模型文件夹路径（包含 model.onnx 和 tokens.txt）
             num_threads: CPU 推理线程数
         """
-        ok, msg = check_speech_dependencies()
+        ok, msg = check_speech_dependencies(device)
         if not ok:
             raise RuntimeError(msg)
 
@@ -578,7 +737,7 @@ class SherpaONNXRecognizer:
             SherpaONNXRecognizer._instance._cache_key = cache_key
 
         self.recognizer = SherpaONNXRecognizer._instance
-        self.microphone = SounddeviceMicrophone(energy_threshold=energy_threshold)
+        self.microphone = SounddeviceMicrophone(device=device, energy_threshold=energy_threshold)
         self.sample_rate = self.microphone.sample_rate
 
     def _recognize_wav(self, wav_bytes):
@@ -591,7 +750,7 @@ class SherpaONNXRecognizer:
                 sample_rate = wf.getframerate()
                 frames = wf.readframes(wf.getnframes())
 
-            audio_samples = np.frombuffer(frames, dtype=np.int16)
+            audio_samples = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
 
             stream = self.recognizer.create_stream()
             stream.accept_waveform(sample_rate, audio_samples)
@@ -612,6 +771,7 @@ class SherpaONNXRecognizer:
         """把一段 float32 单声道音频块转成 16-bit PCM 的 WAV 字节（供 VAD 检测用）"""
         return _block_to_wav(block, self.sample_rate)
 
+    @owns_microphone
     def listen_once(self, timeout=5, phrase_time_limit=8):
         """录制并识别一段语音，返回 (success, text or error_message)。
 
@@ -619,115 +779,15 @@ class SherpaONNXRecognizer:
         不再固定等待整段时长，显著降低响应延迟、提升流畅度。
         """
         ok, audio_or_error = self.microphone.listen_until_silence(
-            max_duration=phrase_time_limit, silence_duration=1.0
+            max_duration=phrase_time_limit, silence_duration=0.6, timeout=timeout
         )
         if not ok:
             return False, audio_or_error
         return self._recognize_wav(audio_or_error)
 
+    @owns_microphone
     def listen_with_wake_word(self, wake_words=None, on_wake=None, sensitivity=0.8):
-        """持续监听唤醒词（高噪音环境友好）。
-
-        不再依赖能量阈值切分语音（环境噪音大时能量阈值不可靠），
-        改为持续流式录音 + 滑动窗口定期识别，靠本地 STT（SenseVoice）
-        的抗噪能力从背景噪音中识别出唤醒词。
-
-        Args:
-            wake_words: 唤醒词列表
-            on_wake: 命中唤醒词瞬间的回调（如播报"我在"）
-        Returns:
-            (True, 指令文本) 或 (False, 错误信息)
-        """
-        if wake_words is None:
-            wake_words = []
-
-        rate = int(self.sample_rate)
-        window = 3.0   # 每次识别的音频窗口（秒）
-        step = 1.5     # 窗口前进步长（秒），重叠以降低漏检
-        block = int(rate * 0.1)
-        window_frames = int(rate * window)
-        step_frames = int(rate * step)
-
-        buffer = np.zeros((0,), dtype=np.float32)
-        _fail_count = 0
-
-        def _to_wav(audio):
-            audio_int16 = np.int16(np.clip(audio, -1.0, 1.0) * 32767)
-            buf = io.BytesIO()
-            with wave.open(buf, 'wb') as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(rate)
-                wf.writeframes(audio_int16.tobytes())
-            return buf.getvalue()
-
-        try:
-            with sd.InputStream(samplerate=rate, channels=1, dtype='float32',
-                                device=self.microphone.device, blocksize=block) as stream:
-                while True:
-                    # 采集 step 秒音频
-                    collected = 0
-                    parts = []
-                    while collected < step_frames:
-                        data, _ = stream.read(block)
-                        parts.append(data[:, 0])
-                        collected += data.shape[0]
-                    new_audio = np.concatenate(parts)
-
-                    buffer = np.concatenate([buffer, new_audio])
-                    if buffer.shape[0] > window_frames:
-                        buffer = buffer[-window_frames:]
-                    if buffer.shape[0] < window_frames:
-                        continue  # 窗口还没攒满，继续采集
-
-                    # 静音跳过：仅在检测到语音活动时做完整识别，避免无谓的高 CPU 解码
-                    rms = float(np.sqrt(np.mean(buffer.astype(np.float64) ** 2)))
-                    if rms < self.microphone.energy_threshold:
-                        continue
-
-                    ok, text = self._recognize_wav(_to_wav(buffer))
-                    if not ok:
-                        _fail_count += 1
-                        if _fail_count % 10 == 1:
-                            print(f'[监听] 未识别到内容（已 {_fail_count} 次），继续监听...')
-                        continue
-                    _fail_count = 0
-
-                    normalized = text.lower().strip()
-                    print(f'[监听] 识别: [{text}]')
-
-                    if not wake_words:
-                        return True, normalized
-
-                    found_wake, remaining = match_wake_word(normalized, wake_words, threshold=sensitivity)
-                    if not found_wake:
-                        continue
-
-                    # 命中唤醒词：触发回调（如播报"我在"）
-                    if on_wake:
-                        try:
-                            on_wake()
-                        except Exception:
-                            pass
-
-                    if remaining:
-                        return True, remaining
-
-                    # 只说唤醒词：进入聆听指令状态（VAD 端点检测，说完即停）
-                    print('[唤醒] 已唤醒，请说出指令...')
-                    while True:
-                        ok2, wav2 = self.microphone.listen_until_silence(
-                            max_duration=8.0, silence_duration=1.0
-                        )
-                        if not ok2:
-                            continue
-                        ok2, text2 = self._recognize_wav(wav2)
-                        if not ok2:
-                            continue
-                        return True, text2.strip()
-        except Exception as e:
-            print(f'[监听] 录音错误: {e}')
-            return False, str(e)
+        return listen_for_wake(self, wake_words or [], on_wake, sensitivity)
 
     def _kws_native_covers(self, keywords, model_dir):
         """判断 KWS 模型原生词表是否覆盖配置的唤醒词。
@@ -803,7 +863,8 @@ class SherpaONNXRecognizer:
             return None
         # 生成唤醒词文件（KeywordSpotter 需要 keywords_file）
         # 该模型 tokens 是拼音（ppinyin），需用 text2token 把中文词转成拼音 token 序列
-        keywords_file = os.path.join(model_dir, 'keywords.txt')
+        from src.storage import user_file
+        keywords_file = user_file('kws_keywords.txt')
         try:
             token_seqs = sherpa_onnx.text2token(
                 list(keywords), tokens, tokens_type='ppinyin'
@@ -841,6 +902,7 @@ class SherpaONNXRecognizer:
             print(f'[KWS] 初始化失败: {e}')
             return None
 
+    @owns_microphone
     def listen_with_kws(self, keywords=None, on_wake=None, sensitivity=None):
         """低功耗唤醒词检测（KeywordSpotter）。
 
@@ -850,7 +912,11 @@ class SherpaONNXRecognizer:
         """
         if keywords is None:
             keywords = []
-        spotter = self._init_kws(keywords, sensitivity)
+        cache_key = (tuple(keywords), sensitivity)
+        if getattr(self, '_kws_cache_key', None) != cache_key:
+            self._kws_cache_key = cache_key
+            self._kws_cached = self._init_kws(keywords, sensitivity)
+        spotter = self._kws_cached
         if spotter is None:
             print('[KWS] 模型不可用，回退到滑动窗口识别')
             return self.listen_with_wake_word(keywords, on_wake, sensitivity)
@@ -860,9 +926,11 @@ class SherpaONNXRecognizer:
         block = int(rate * 0.1)  # 100ms
         try:
             kws_stream = spotter.create_stream()
-            with sd.InputStream(samplerate=rate, channels=1, dtype='int16',
+            with sd.InputStream(samplerate=rate, channels=1, dtype='float32',
                                 device=self.microphone.device, blocksize=block) as stream:
                 while True:
+                    if capture_should_stop():
+                        return False, '监听已取消'
                     data, _ = stream.read(block)
                     samples = data[:, 0]
                     kws_stream.accept_waveform(rate, samples)
@@ -878,7 +946,9 @@ class SherpaONNXRecognizer:
                                     on_wake()
                                 except Exception:
                                     pass
-                            return self._listen_command_after_wake()
+                            stream.stop()
+                            stream.close()
+                            return self.listen_once(timeout=5, phrase_time_limit=10)
         except Exception as e:
             print(f'[KWS] 监听错误: {e}')
             return False, str(e)

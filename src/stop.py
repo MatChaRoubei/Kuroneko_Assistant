@@ -4,11 +4,15 @@ import time
 
 STOP_REQUESTED = threading.Event()
 OUTPUT_DONE = threading.Event()
+OUTPUT_DONE.set()
 _listener_thread = None
+_session = 0
 
 
 def begin_output():
     """开始一次输出前调用：清除停止标志"""
+    global _session
+    _session += 1
     STOP_REQUESTED.clear()
     OUTPUT_DONE.clear()
 
@@ -21,6 +25,8 @@ def end_output():
 def request_stop():
     """请求停止当前输出"""
     STOP_REQUESTED.set()
+    from src.feedback import clear_speaking
+    clear_speaking()
 
 
 def is_stop_requested():
@@ -34,15 +40,16 @@ def start_stop_listener(use_voice=False, recognizer=None, stop_words=None):
     命中后调用 request_stop()，由执行侧（AI 生成循环 / TTS 队列）进行中断。
     """
     global _listener_thread
-    if _listener_thread is not None and _listener_thread.is_alive():
+    if _listener_thread is not None and _listener_thread.is_alive() and getattr(_listener_thread, 'session', None) == _session:
         return
 
     if use_voice:
         if recognizer is None:
             return
         _listener_thread = threading.Thread(
-            target=_listen_voice, args=(recognizer, stop_words), daemon=True
+            target=_listen_voice, args=(recognizer, stop_words, _session), daemon=True, name='stop-listener'
         )
+        _listener_thread.session = _session
         _listener_thread.start()
         return
 
@@ -72,19 +79,24 @@ def _listen_keyboard():
         time.sleep(0.05)
 
 
-def _listen_voice(recognizer, stop_words=None):
+def _listen_voice(recognizer, stop_words=None, session=None):
     if stop_words is None:
         stop_words = ['停止', '停下', '闭嘴', '别说了', '打住']
     try:
-        from src.recognize import match_phrase
+        from src.recognize import is_stop_command, capture_context
+        capture_context.cancelled = lambda: session != _session or OUTPUT_DONE.is_set() or STOP_REQUESTED.is_set()
     except Exception:
-        match_phrase = None
-    while not OUTPUT_DONE.is_set() and not STOP_REQUESTED.is_set():
+        is_stop_command = None
+    while session == _session and not OUTPUT_DONE.is_set() and not STOP_REQUESTED.is_set():
         try:
             ok, text = recognizer.listen_once(timeout=0.5, phrase_time_limit=2)
+            if session != _session or OUTPUT_DONE.is_set():
+                break
+            if not ok:
+                time.sleep(0.05)
             if ok and text:
-                if match_phrase is not None:
-                    if match_phrase(text, stop_words)[0]:
+                if is_stop_command is not None:
+                    if is_stop_command(text, stop_words):
                         request_stop()
                         break
                 else:
@@ -93,7 +105,7 @@ def _listen_voice(recognizer, stop_words=None):
                             request_stop()
                             break
         except Exception:
-            pass
+            time.sleep(0.1)
 
 
 # ---------- 打断（barge-in）：播放期间检测主人开口即中断 ----------

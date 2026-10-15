@@ -46,6 +46,10 @@ class FuzzyRegexMatcher:
         Returns:
             (intent_name, slots_dict) 或 ('unknown', {})
         """
+        from .commands import parse_command
+        parsed = parse_command(text)
+        if parsed is not None:
+            return parsed
         text = text.strip().lower()
 
         # 1. 尝试 JSON 中的正则 patterns

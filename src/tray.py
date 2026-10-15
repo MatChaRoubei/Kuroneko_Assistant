@@ -39,7 +39,8 @@ def _on_exit(icon, item):
     except Exception:
         pass
     # 主循环阻塞在录音上，直接结束进程最可靠（PyInstaller 父进程会清理临时目录）
-    os._exit(0)
+    from src.lifecycle import request_exit
+    request_exit()
 
 
 def _on_show(icon, item):

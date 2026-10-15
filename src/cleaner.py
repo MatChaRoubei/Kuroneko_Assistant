@@ -1,16 +1,12 @@
-"""磁盘空间清理模块（杀空间）。
+"""Clean only old audio owned by this application's private temp directory.
 
-负责把临时文件重定向到应用所在盘（D 盘），并在后台定期清理
-PyInstaller 单文件 exe 的解压残留与临时音频。全程不阻塞主线程、
-不误删正在使用的文件，从而与语音监听无缝衔接，保证没有漏洞。
+Never traverse the system temp directory or remove bootloader extractions.
 """
 import os
 import sys
 import glob
-import shutil
 import threading
 import time
-from pathlib import Path
 
 
 _SYSTEM_TEMP = None    # 重定向前保存的系统临时目录（通常是 C 盘）
@@ -20,10 +16,8 @@ _active_lock = threading.Lock()
 
 
 def get_app_root():
-    """返回可写目录：打包运行 -> exe 所在目录；源码运行 -> 项目根"""
-    if getattr(sys, 'frozen', False):
-        return os.path.dirname(os.path.abspath(sys.executable))
-    return str(Path(__file__).resolve().parent.parent)
+    from src.storage import data_directory
+    return str(data_directory())
 
 
 def setup_temp_dir():
@@ -118,32 +112,25 @@ def cleanup_temp_files():
         current = os.path.realpath(current).lower()
 
     targets = set()
-    for root in (_TEMP_DIR, _SYSTEM_TEMP):
+    for root in (_TEMP_DIR,):
         if root and os.path.isdir(root):
             targets.add(os.path.realpath(root))
 
     cleaned = 0
     freed = 0
     for root in targets:
-        # 1) PyInstaller 单文件 exe 的解压残留 _MEI*
-        for d in glob.glob(os.path.join(root, '_MEI*')):
-            try:
-                if current and os.path.realpath(d).lower() == current:
-                    continue  # 跳过当前进程正在使用的目录
-                if not os.path.isdir(d):
-                    continue
-                freed += _dir_size(d)
-                shutil.rmtree(d, ignore_errors=True)
-                cleaned += 1
-            except Exception:
-                continue
+        # Extraction directories belong to the bootloader. Never remove another
+        # running application's _MEI directory (including a second instance).
         # 2) TTS 临时音频等（跳过正在播放的文件）
         for f in glob.glob(os.path.join(root, 'assistant_tts*.mp3')):
             try:
                 if _is_active(f):
                     continue
-                freed += os.path.getsize(f)
+                if os.path.islink(f) or time.time() - os.path.getmtime(f) < 3600:
+                    continue
+                size = os.path.getsize(f)
                 os.remove(f)
+                freed += size
                 cleaned += 1
             except Exception:
                 continue

@@ -1,0 +1,26 @@
+[
+  {
+    "voice": "zh-CN-XiaoxiaoNeural",
+    "ok": true,
+    "bytes": 47520,
+    "seconds": 4.023,
+    "audio_duration": 7.92,
+    "sample": "D:\\Assistant\\docs\\microsoft-xiaoxiao-test.mp3"
+  },
+  {
+    "voice": "zh-CN-XiaoyiNeural",
+    "ok": true,
+    "bytes": 26640,
+    "seconds": 2.327,
+    "audio_duration": 4.44,
+    "sample": "D:\\Assistant\\docs\\microsoft-xiaoyi-test.mp3"
+  },
+  {
+    "voice": "ja-JP-NanamiNeural",
+    "ok": true,
+    "bytes": 19728,
+    "seconds": 2.046,
+    "audio_duration": 3.288,
+    "sample": "D:\\Assistant\\docs\\microsoft-nanami-test.mp3"
+  }
+]

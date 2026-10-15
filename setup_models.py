@@ -52,7 +52,14 @@ def download(url, filename):
             )
             sys.stdout.flush()
 
-    urllib.request.urlretrieve(url, dest, reporthook=hook)
+    temporary = dest + '.part'
+    try:
+        urllib.request.urlretrieve(url, temporary, reporthook=hook)
+        os.replace(temporary, dest)
+    except BaseException:
+        if os.path.exists(temporary):
+            os.remove(temporary)
+        raise
     print(f'\n下载完成: {filename}')
     return dest
 
@@ -60,7 +67,7 @@ def download(url, filename):
 def setup_sense_voice():
     """下载 SenseVoice 模型 -> models/sense_voice/"""
     dest = os.path.join(ROOT, 'models', 'sense_voice')
-    if os.path.exists(os.path.join(dest, 'model.int8.onnx')):
+    if all(os.path.isfile(os.path.join(dest, name)) for name in ('model.int8.onnx', 'tokens.txt')):
         print('[OK] SenseVoice 模型已就绪')
         return
 
@@ -80,7 +87,7 @@ def setup_sense_voice():
 def setup_vits():
     """下载 VITS TTS 模型 -> models/vits-melo-tts-zh_en/"""
     dest = os.path.join(ROOT, 'models', 'vits-melo-tts-zh_en')
-    if os.path.exists(os.path.join(dest, 'model.onnx')):
+    if all(os.path.isfile(os.path.join(dest, name)) for name in ('model.onnx', 'tokens.txt', 'lexicon.txt')):
         print('[OK] VITS TTS 模型已就绪')
         return
 
@@ -91,7 +98,9 @@ def setup_vits():
             name = m.name.split('/', 1)[-1]  # 去掉顶层目录
             if not name or not m.isfile():
                 continue
-            target = os.path.join(dest, name)
+            target = os.path.abspath(os.path.join(dest, name))
+            if os.path.commonpath([os.path.abspath(dest), target]) != os.path.abspath(dest):
+                raise ValueError('模型归档包含无效路径')
             os.makedirs(os.path.dirname(target), exist_ok=True)
             with tf.extractfile(m) as src, open(target, 'wb') as dst:
                 shutil.copyfileobj(src, dst)
@@ -119,10 +128,22 @@ def setup_kws():
     print('[OK] KWS 唤醒词检测模型放置完成')
 
 
+def setup_vad():
+    from pathlib import Path
+    dest = Path(ROOT) / 'models' / 'vad' / 'silero_vad.onnx'
+    if dest.is_file():
+        return
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    temporary = download('https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx', '_silero_vad.onnx')
+    os.replace(temporary, dest)
+    print('[OK] Silero 语音端点模型已就绪')
+
+
 if __name__ == '__main__':
     print('=== 黑猫语音助手 - 语音模型下载 ===')
     try:
         setup_sense_voice()
+        setup_vad()
         setup_vits()
         setup_kws()
         print('=== 全部完成 ===')

@@ -9,20 +9,26 @@ import json
 import threading
 
 
+from src.storage import data_directory, user_file, write_json
+import queue
+
+
 def get_app_root():
-    """可写目录：打包运行 -> exe 所在目录；源码运行 -> 项目根"""
-    if getattr(sys, 'frozen', False):
-        return os.path.dirname(os.path.abspath(sys.executable))
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return str(data_directory())
 
 
 def get_selection_file():
-    return os.path.join(get_app_root(), 'model_selection.json')
+    return user_file('model_selection.json')
 
 
-def load_selected_model():
+def load_selected_model(default=''):
     """读取用户手动选择的模型名，未选择返回空字符串"""
     try:
+        # New settings are one atomic document; keep reading legacy selections.
+        from src.storage import read_json
+        settings = read_json(get_settings_file(), {})
+        if isinstance(settings, dict) and 'ollama_model' in settings:
+            return str(settings['ollama_model'] or '').strip()
         path = get_selection_file()
         if os.path.exists(path):
             with open(path, 'r', encoding='utf-8') as f:
@@ -30,15 +36,14 @@ def load_selected_model():
                 return (data.get('ollama_model') or '').strip()
     except Exception:
         pass
-    return ''
+    return default or ''
 
 
 def save_selected_model(model):
     """保存用户选择的模型名"""
     try:
         path = get_selection_file()
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump({'ollama_model': model}, f, ensure_ascii=False, indent=2)
+        write_json(path, {'ollama_model': model})
         return True
     except Exception:
         return False
@@ -48,223 +53,297 @@ def list_ollama_models():
     """检测 Ollama 已部署的模型，返回模型名列表"""
     try:
         import ollama
-        models = ollama.list()
+        models = ollama.Client(timeout=3).list()
         return [m.model for m in (models.models or [])]
     except Exception:
         return []
 
 
 def show_model_selector():
-    """弹窗：检测并选择 Ollama 模型"""
-    import tkinter as tk
-    from tkinter import ttk, messagebox
-
-    def _build():
-        try:
-            root = tk.Tk()
-            root.title('黑猫语音助手 - 模型设置')
-            root.geometry('440x320')
-            root.resizable(False, False)
-            root.attributes('-topmost', True)
-
-            tk.Label(root, text='选择 Ollama 大模型', font=('Microsoft YaHei', 13, 'bold')).pack(pady=(16, 2))
-            tk.Label(root, text='AI 对话将使用所选模型', fg='gray').pack()
-
-            # 模型下拉框
-            frame = tk.Frame(root)
-            frame.pack(pady=14)
-            tk.Label(frame, text='模型：', font=('Microsoft YaHei', 10)).pack(side='left')
-            combo = ttk.Combobox(frame, width=32, state='readonly', font=('Microsoft YaHei', 10))
-            combo.pack(side='left', padx=6)
-
-            status = tk.Label(root, text='', fg='gray', font=('Microsoft YaHei', 9))
-            status.pack()
-
-            def refresh():
-                models = list_ollama_models()
-                combo['values'] = models
-                if models:
-                    combo.current(0)
-                    status.config(text=f'检测到 {len(models)} 个模型', fg='green')
-                else:
-                    status.config(text='未检测到模型，请确认 Ollama 正在运行', fg='red')
-
-            tk.Button(root, text='刷新检测', command=refresh, font=('Microsoft YaHei', 10)).pack(pady=6)
-
-            current = load_selected_model()
-            models = list_ollama_models()
-            combo['values'] = models
-            if current and current in models:
-                combo.set(current)
-                status.config(text=f'当前：{current}', fg='green')
-            elif models:
-                combo.current(0)
-                status.config(text=f'检测到 {len(models)} 个模型', fg='gray')
-
-            def save():
-                model = combo.get()
-                if not model:
-                    messagebox.showwarning('提示', '请先选择一个模型', parent=root)
-                    return
-                if save_selected_model(model):
-                    try:
-                        from src.executor import configure_ollama
-                        configure_ollama(model)
-                    except Exception:
-                        pass
-                    messagebox.showinfo('成功', f'已切换到模型：\n{model}\n\n下次 AI 对话即生效', parent=root)
-                    root.destroy()
-                else:
-                    messagebox.showerror('失败', '保存失败，请检查目录权限', parent=root)
-
-            tk.Button(root, text='保存并应用', command=save, bg='#4CAF50', fg='white',
-                      font=('Microsoft YaHei', 11, 'bold'), width=16).pack(pady=12)
-
-            root.mainloop()
-        except Exception as e:
-            print(f'[GUI] 窗口启动失败: {e}')
-
-    threading.Thread(target=_build, daemon=True, name='model-selector').start()
-
-
-def get_resource_root():
-    """资源根目录：打包运行 -> _MEIPASS；源码运行 -> 项目根"""
-    if getattr(sys, 'frozen', False):
-        return getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(sys.executable)))
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    show_settings()
 
 
 class MainWindow:
-    """主窗口：以 firstUI.png 为背景，实时展示识别内容和输出内容"""
-
-    def __init__(self):
+    """All Tk calls stay on the UI thread; workers only enqueue updates."""
+    def __init__(self, on_submit=None, on_pause=None, on_retry=None, on_speak=None):
         self.root = None
         self.text = None
-        self.status_label = None
-        self._win_w = 1000
-        self._win_h = 560
+        self._events = queue.Queue()
+        self._on_submit = on_submit
+        self._on_pause = on_pause
+        self._on_retry = on_retry
+        self._on_speak = on_speak
+        self._ready = False
+        self._busy = False
+        self._tray_available = False
+        self._settings = None
+        self._stream_start = None
+        self._history = []
+        self._history_index = 0
+        self._draft = ''
+        self._capturing = False
 
     def run(self):
-        """阻塞运行窗口（在调用线程）"""
+        import tkinter as tk
+        from tkinter import ttk
+        from src.lifecycle import shutdown, request_exit
+        if sys.platform == 'win32':
+            try:
+                import ctypes
+                ctypes.windll.shcore.SetProcessDpiAwareness(1)
+            except Exception:
+                pass
+        self.root = tk.Tk()
+        self.root.title('黑猫语音助手 · 0.0.9')
+        width = min(900, self.root.winfo_screenwidth() - 80)
+        height = min(640, self.root.winfo_screenheight() - 100)
+        self.root.geometry(f'{width}x{height}+30+30')
+        self.root.minsize(660, 480)
+        self.root.configure(bg='#f2f5fa')
         try:
-            import tkinter as tk
-            from PIL import Image, ImageTk
+            from src.config import get_resource_root
+            self.root.iconbitmap(os.path.join(get_resource_root(), 'icon.ico'))
+        except Exception:
+            pass
+        style = ttk.Style(self.root)
+        style.theme_use('clam')
+        style.configure('TButton', font=('Microsoft YaHei', 10), padding=(12, 7))
+        style.configure('Accent.TButton', background='#345ce6', foreground='white')
+        header = tk.Frame(self.root, bg='#f2f5fa')
+        header.pack(fill='x', padx=24, pady=(20, 12))
+        tk.Label(header, text='黑猫语音助手', font=('Microsoft YaHei', 19, 'bold'),
+                 fg='#18253b', bg='#f2f5fa').pack(side='left')
+        ttk.Button(header, text='设置', command=show_settings).pack(side='right')
+        self.status_label = tk.Label(self.root, text='正在准备，请稍候…', anchor='w',
+                                     bg='#f2f5fa', fg='#345ce6', font=('Microsoft YaHei', 10))
+        self.status_label.pack(fill='x', padx=26, pady=(0, 10))
+        frame = tk.Frame(self.root, bg='white', highlightbackground='#dce3ef', highlightthickness=1)
+        frame.pack(fill='both', expand=True, padx=24)
+        self.text = tk.Text(frame, bg='white', fg='#263348', font=('Microsoft YaHei', 11),
+                            wrap='word', relief='flat', padx=18, pady=16, spacing3=8, state='disabled', height=8, width=1)
+        scroll = ttk.Scrollbar(frame, command=self.text.yview)
+        self.text.configure(yscrollcommand=scroll.set)
+        scroll.pack(side='right', fill='y')
+        self.text.pack(fill='both', expand=True)
+        for tag, color in [('asr', '#345ce6'), ('out', '#263348'), ('sys', '#65748c')]:
+            self.text.tag_configure(tag, foreground=color)
+        entry_row = tk.Frame(self.root, bg='#f2f5fa')
+        entry_row.pack(fill='x', padx=24, pady=(14, 8))
+        self.entry = ttk.Entry(entry_row, font=('Microsoft YaHei', 11))
+        self.entry.pack(side='left', fill='x', expand=True, ipady=8)
+        self.entry.bind('<Return>', self._submit)
+        self.entry.bind('<Up>', lambda event: self._recall(-1))
+        self.entry.bind('<Down>', lambda event: self._recall(1))
+        self.send_button = ttk.Button(entry_row, text='发送', style='Accent.TButton', command=self._submit)
+        self.send_button.pack(side='left', padx=(10, 0))
+        self.speak_button = ttk.Button(entry_row, text='说一句 (F8)', command=self._speak_once)
+        self.speak_button.pack(side='left', padx=(8, 0))
+        self.speak_button.state(['disabled'])
+        self.send_button.state(['disabled'])
+        controls = tk.Frame(self.root, bg='#f2f5fa')
+        controls.pack(fill='x', padx=24, pady=(0, 12))
+        from src.lifecycle import voice_paused
+        self.pause_button = ttk.Button(controls, text='恢复监听' if voice_paused.is_set() else '暂停监听', command=self._pause)
+        self.pause_button.pack(side='left')
+        self.stop_button = ttk.Button(controls, text='停止回答 (Esc)', command=self._stop)
+        self.stop_button.pack(side='left', padx=6)
+        self.stop_button.state(['disabled'])
+        ttk.Button(controls, text='重试麦克风', command=self._retry_microphone).pack(side='left')
+        ttk.Button(controls, text='清空对话显示', command=self._on_clear).pack(side='right')
+        ttk.Button(controls, text='退出', command=request_exit).pack(side='right', padx=6)
+        self.input_hint = tk.Label(self.root, text='正在准备输入…', anchor='w',
+                                   bg='#f2f5fa', fg='#65748c', font=('Microsoft YaHei', 9))
+        self.input_hint.pack(fill='x', padx=26, pady=(0, 14))
+        self.root.bind('<Escape>', lambda event: self._stop())
+        self.root.bind('<F8>', lambda event: self._speak_once())
+        self.root.protocol('WM_DELETE_WINDOW', self._on_close)
+        self.append_system('欢迎使用。可以说“唤醒词 + 指令”，也可以直接在下方输入。\n试试：现在几点、打开记事本、搜索一下天气。')
+        self.root.after(30, self._drain)
+        self.root.mainloop()
+        request_exit()
 
-            W, H = self._win_w, self._win_h
-            self.root = tk.Tk()
-            self.root.title('黑猫语音助手')
-            self.root.geometry(f'{W}x{H}')
-            self.root.resizable(False, False)
+    def _drain(self):
+        from src.lifecycle import shutdown
+        if shutdown.is_set():
+            self.root.destroy()
+            return
+        # Bound each frame's work so bursts cannot starve input/paint events.
+        for _ in range(80):
+            try:
+                callback = self._events.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                callback()
+            except Exception as exc:
+                print(f'[GUI] 更新失败: {exc}')
+        self.root.after(30, self._drain)
 
-            # 背景图
-            bg_path = os.path.join(get_resource_root(), 'firstUI.png')
-            self._bg = None
-            if os.path.exists(bg_path):
-                try:
-                    img = Image.open(bg_path).resize((W, H), Image.LANCZOS)
-                    self._bg = ImageTk.PhotoImage(img)
-                except Exception as e:
-                    print(f'[GUI] 背景图加载失败: {e}')
+    def _post(self, callback):
+        self._events.put(callback)
 
-            canvas = tk.Canvas(self.root, width=W, height=H, highlightthickness=0)
-            canvas.pack(fill='both', expand=True)
-            if self._bg:
-                canvas.create_image(0, 0, image=self._bg, anchor='nw')
+    def _submit(self, event=None):
+        query = self.entry.get().strip()
+        if query and self._ready and not self._busy and self._on_submit:
+            if self._on_submit(query):
+                if not self._history or self._history[-1] != query:
+                    self._history.append(query)
+                    self._history = self._history[-50:]
+                self._history_index = len(self._history)
+                self._draft = ''
+                self.entry.delete(0, 'end')
+                self.entry.focus_set()
+        elif query and self._busy:
+            self.input_hint.configure(text='当前回答结束后可发送；也可以先按 Esc 停止。输入内容会保留。')
+        return 'break'
 
-            # 顶部状态
-            self.status_label = tk.Label(self.root, text='● 监听中', fg='#ffffff',
-                                         bg='#0e1621', font=('Microsoft YaHei', 12, 'bold'),
-                                         padx=18, pady=4)
-            canvas.create_window(W // 2, 32, window=self.status_label)
+    def _recall(self, direction):
+        if not self._history:
+            return 'break'
+        if self._history_index == len(self._history):
+            self._draft = self.entry.get()
+        self._history_index = max(0, min(len(self._history), self._history_index + direction))
+        text = self._draft if self._history_index == len(self._history) else self._history[self._history_index]
+        self.entry.delete(0, 'end')
+        self.entry.insert(0, text)
+        self.entry.icursor('end')
+        return 'break'
 
-            # 中部对话区（白色卡片，简约清爽）
-            frame = tk.Frame(self.root, bg='#ffffff', highlightthickness=1, highlightbackground='#ccd5e0')
-            self.text = tk.Text(frame, bg='#ffffff', fg='#2b3440',
-                                font=('Microsoft YaHei', 11), wrap='word',
-                                insertbackground='#2b3440', relief='flat',
-                                padx=16, pady=14, spacing1=3, spacing3=3)
-            scroll = tk.Scrollbar(frame, command=self.text.yview)
-            self.text.configure(yscrollcommand=scroll.set)
-            self.text.pack(side='left', fill='both', expand=True)
-            scroll.pack(side='right', fill='y')
-            canvas.create_window(W // 2, H // 2 - 5, window=frame, width=W - 120, height=H - 140)
+    def _speak_once(self):
+        if self._ready and not self._busy and self._on_speak:
+            self._on_speak()
+        return 'break'
 
-            # 文字配色
-            self.text.tag_configure('asr', foreground='#1976d2')   # 你（识别）蓝色
-            self.text.tag_configure('out', foreground='#2b3440')   # 助手深灰
-            self.text.tag_configure('sys', foreground='#9aa4b2')   # 系统浅灰
+    def _retry_microphone(self):
+        from src.lifecycle import voice_paused
+        voice_paused.clear()
+        self.pause_button.configure(text='暂停监听')
+        if self._on_retry:
+            self._on_retry()
 
-            # 底部按钮
-            btn = tk.Frame(self.root, bg='#0e1621')
-            b = dict(font=('Microsoft YaHei', 10), width=10, relief='flat', cursor='hand2')
-            tk.Button(btn, text='⚙ 设置', bg='#ffffff', fg='#2b3440', command=self._on_settings, **b).pack(side='left', padx=6)
-            tk.Button(btn, text='清空', bg='#ffffff', fg='#2b3440', command=self._on_clear, **b).pack(side='left', padx=6)
-            tk.Button(btn, text='退出', bg='#e57373', fg='white', command=self._on_exit, **b).pack(side='left', padx=6)
-            canvas.create_window(W // 2, H - 28, window=btn)
+    def _pause(self):
+        from src.lifecycle import voice_paused, cancel_capture
+        if voice_paused.is_set():
+            voice_paused.clear()
+        else:
+            voice_paused.set()
+            cancel_capture()
+        self.pause_button.configure(text='恢复监听' if voice_paused.is_set() else '暂停监听')
+        if self._on_pause:
+            self._on_pause()
 
-            self.append_system('黑猫语音助手已启动，说「你好黑猫」唤醒')
-            # 关闭窗口 = 隐藏到托盘，而不是退出进程
-            self.root.protocol('WM_DELETE_WINDOW', self._on_close)
-            self.root.mainloop()
-        except Exception as e:
-            print(f'[GUI] 主窗口启动失败: {e}')
+    def _stop(self):
+        if self._capturing:
+            from src.lifecycle import cancel_capture
+            cancel_capture()
+            self.set_status('已取消录音。')
+        if not self._busy:
+            return
+        from src.stop import request_stop
+        request_stop()
+        self.stop_button.state(['disabled'])
+        self.set_status('正在停止回答…')
 
     def _on_clear(self):
-        if self.text:
-            self.text.delete('1.0', 'end')
-
-    def _on_settings(self):
-        show_settings()
+        self.text.configure(state='normal')
+        self.text.delete('1.0', 'end')
+        self._stream_start = None
+        self.text.configure(state='disabled')
 
     def _on_close(self):
-        """关闭窗口 = 隐藏到托盘，程序继续后台运行"""
-        if self.root:
-            try:
-                self.root.withdraw()
-            except Exception:
-                pass
+        if self._tray_available:
+            self.root.withdraw()
+        else:
+            from src.lifecycle import request_exit
+            request_exit()
 
     def show(self):
-        """显示窗口（从托盘唤起），并恢复正确的位置和大小"""
-        if self.root:
-            try:
-                self.root.deiconify()
-                # withdraw 后 geometry 可能丢失，重新设置并居中
-                w, h = self._win_w, self._win_h
-                x = (self.root.winfo_screenwidth() - w) // 2
-                y = (self.root.winfo_screenheight() - h) // 2
-                self.root.geometry(f'{w}x{h}+{x}+{y}')
-                self.root.lift()
-                self.root.focus_force()
-            except Exception:
-                pass
+        def restore():
+            self.root.deiconify()
+            self.root.lift()
+            self.entry.focus_set()
+        self._post(restore)
 
-    def _on_exit(self):
-        os._exit(0)
+    def set_ready(self, ready=True):
+        self._post(lambda: self._set_controls(ready, self._busy))
 
-    def _post(self, fn):
-        if self.root:
-            try:
-                self.root.after(0, fn)
-            except Exception:
-                pass
+    def set_busy(self, busy):
+        self._post(lambda: self._set_controls(self._ready, busy))
+
+    def set_capturing(self, capturing):
+        def update():
+            self._capturing = capturing
+            self._set_controls(self._ready, self._busy)
+            self.speak_button.configure(text='正在听…' if capturing else '说一句 (F8)')
+        self._post(update)
+
+    def _set_controls(self, ready, busy):
+        just_ready = ready and not self._ready
+        self._ready, self._busy = ready, busy
+        self.send_button.state(['!disabled'] if ready and not busy else ['disabled'])
+        self.speak_button.state(['!disabled'] if ready and not busy and not self._capturing else ['disabled'])
+        self.send_button.configure(text='处理中…' if busy else '发送')
+        self.stop_button.state(['!disabled'] if busy or self._capturing else ['disabled'])
+        self.input_hint.configure(text='可先输入下一条，按 Esc 停止当前回答后发送。' if busy else
+                                  '回车发送 · ↑↓ 找回最近输入 · AI 聊天需在设置中选择模型' if ready else '正在准备输入…')
+        if just_ready:
+            self.entry.focus_set()
 
     def set_status(self, text):
-        self._post(lambda: self.status_label.config(text=text) if self.status_label else None)
+        self._post(lambda: self.status_label.configure(text=text))
 
     def append_asr(self, text):
         self._post(lambda: self._insert(f'你：{text}\n', 'asr'))
 
     def append_output(self, text):
-        self._post(lambda: self._insert(f'助手：{text}\n', 'out'))
+        def finish():
+            if self._stream_start is not None:
+                self.text.configure(state='normal')
+                self.text.delete(self._stream_start, 'end-1c')
+                self.text.configure(state='disabled')
+                self._stream_start = None
+            self._insert(f'黑猫：{text}\n', 'out')
+        self._post(finish)
+
+    def stream_output(self, piece):
+        def update():
+            if self._stream_start is None:
+                self._stream_start = 'live_start'
+                self.text.mark_set('live_start', 'end-1c')
+                self.text.mark_gravity('live_start', 'left')
+                self._insert('黑猫：', 'out')
+            self._insert(piece, 'out')
+        self._post(update)
 
     def append_system(self, text):
         self._post(lambda: self._insert(f'{text}\n', 'sys'))
 
     def _insert(self, line, tag):
-        if self.text:
-            self.text.insert('end', line, tag)
+        at_bottom = self.text.yview()[1] >= 0.98
+        self.text.configure(state='normal')
+        self.text.insert('end', line, tag)
+        lines = int(self.text.index('end-1c').split('.')[0])
+        if lines > 1800:
+            self.text.delete('1.0', f'{lines - 1500}.0')
+        self.text.configure(state='disabled')
+        if at_bottom:
             self.text.see('end')
+
+
+def ask_confirmation(message):
+    """Run an action confirmation on Tk's owner thread with a bounded wait."""
+    if _ui is None:
+        return False
+    completed = threading.Event()
+    result = [False]
+    def ask():
+        from tkinter import messagebox
+        _ui.root.deiconify()
+        result[0] = messagebox.askyesno('确认系统操作', message, parent=_ui.root)
+        completed.set()
+    _ui._post(ask)
+    completed.wait(120)
+    return result[0]
 
 
 # 运行时设置（唤醒词、停止词、灵敏度、TTS 引擎）
@@ -280,6 +359,12 @@ _runtime = {
     'tts_azure_region': 'chinaeast2',        # Azure 区域(需与订阅资源一致)
     'tts_azure_voice': 'zh-CN-XiaoxiaoNeural',  # Azure 神经语音音色
     'stop_words': ['停止', '停下', '闭嘴', '别说了', '打住'],
+    'microphone': None,
+    'energy_threshold': 0.02,
+    'continuous_dialogue': False,
+    'character_voice': {'url': 'http://127.0.0.1:9880', 'ref_audio_path': '', 'prompt_text': '',
+                        'prompt_lang': 'ja', 'text_lang': 'auto', 'speed_factor': 1.0},
+    'japanese_catchphrases': True,
 }
 
 # edge-tts 声音角色（显示名 -> voice id）
@@ -295,9 +380,15 @@ def get_settings_file():
     return os.path.join(get_app_root(), 'settings.json')
 
 
-def load_settings():
+def load_settings(config=None):
     """启动时读取设置，覆盖默认值"""
     global _runtime
+    if config:
+        for key in _runtime:
+            if key in config:
+                _runtime[key] = config[key]
+        if 'wake_word_sensitivity' in config:
+            _runtime['sensitivity'] = config['wake_word_sensitivity']
     try:
         path = get_settings_file()
         if os.path.exists(path):
@@ -307,15 +398,31 @@ def load_settings():
                 ww = data['wake_words']
                 if isinstance(ww, str):
                     ww = [w.strip() for w in ww.replace('，', ',').split(',') if w.strip()]
-                if ww:
-                    _runtime['wake_words'] = ww
+                if isinstance(ww, list) and ww and all(isinstance(word, str) and word.strip() for word in ww):
+                    _runtime['wake_words'] = [word.strip() for word in ww]
             if 'sensitivity' in data:
                 try:
-                    _runtime['sensitivity'] = float(data['sensitivity'])
+                    value = float(data['sensitivity'])
+                    if 0.1 <= value <= 1:
+                        _runtime['sensitivity'] = value
                 except Exception:
                     pass
-            if 'tts_engine' in data and data['tts_engine']:
+            if data.get('tts_engine') in ('vits', 'edge', 'pyttsx3', 'azure', 'auto', 'gptsovits'):
                 _runtime['tts_engine'] = data['tts_engine']
+            if isinstance(data.get('ollama_model'), str):
+                _runtime['ollama_model'] = data['ollama_model']
+            if data.get('microphone') is None or (isinstance(data.get('microphone'), dict) and
+                    all(isinstance(data['microphone'].get(key), str) for key in ('name', 'hostapi'))):
+                _runtime['microphone'] = data.get('microphone')
+            if isinstance(data.get('energy_threshold'), (float, int)) and 0.001 <= data['energy_threshold'] <= 0.2:
+                _runtime['energy_threshold'] = data['energy_threshold']
+            if isinstance(data.get('continuous_dialogue'), bool):
+                _runtime['continuous_dialogue'] = data['continuous_dialogue']
+            if isinstance(data.get('character_voice'), dict):
+                from src.character_tts import DEFAULT_PROFILE
+                _runtime['character_voice'] = {**DEFAULT_PROFILE, **data['character_voice']}
+            if isinstance(data.get('japanese_catchphrases'), bool):
+                _runtime['japanese_catchphrases'] = data['japanese_catchphrases']
             if 'tts_voice' in data and data['tts_voice']:
                 _runtime['tts_voice'] = data['tts_voice']
             if 'tts_style' in data and data['tts_style']:
@@ -334,7 +441,7 @@ def load_settings():
                 sw = data['stop_words']
                 if isinstance(sw, str):
                     sw = [w.strip() for w in sw.replace('，', ',').split(',') if w.strip()]
-                if isinstance(sw, list) and sw:
+                if isinstance(sw, list) and sw and all(isinstance(word, str) and word.strip() for word in sw):
                     _runtime['stop_words'] = sw
     except Exception:
         pass
@@ -343,23 +450,40 @@ def load_settings():
 def save_settings(wake_words, sensitivity, tts_engine, tts_voice=None,
                   tts_style='calm', tts_rate='-5%', tts_pitch='+0Hz',
                   tts_azure_key='', tts_azure_region='chinaeast2',
-                  tts_azure_voice='zh-CN-XiaoxiaoNeural'):
+                  tts_azure_voice='zh-CN-XiaoxiaoNeural', ollama_model=None, stop_words=None,
+                  microphone='unchanged', energy_threshold=None, continuous_dialogue=None,
+                  character_voice=None, japanese_catchphrases=None):
     """保存设置并更新运行时"""
     global _runtime
-    _runtime['wake_words'] = wake_words
-    _runtime['sensitivity'] = sensitivity
-    _runtime['tts_engine'] = tts_engine
+    candidate = _runtime.copy()
+    candidate['wake_words'] = wake_words
+    candidate['sensitivity'] = sensitivity
+    candidate['tts_engine'] = tts_engine
     if tts_voice:
-        _runtime['tts_voice'] = tts_voice
-    _runtime['tts_style'] = tts_style
-    _runtime['tts_rate'] = tts_rate
-    _runtime['tts_pitch'] = tts_pitch
-    _runtime['tts_azure_key'] = tts_azure_key
-    _runtime['tts_azure_region'] = tts_azure_region
-    _runtime['tts_azure_voice'] = tts_azure_voice
+        candidate['tts_voice'] = tts_voice
+    candidate['tts_style'] = tts_style
+    candidate['tts_rate'] = tts_rate
+    candidate['tts_pitch'] = tts_pitch
+    candidate['tts_azure_key'] = tts_azure_key
+    candidate['tts_azure_region'] = tts_azure_region
+    candidate['tts_azure_voice'] = tts_azure_voice
+    if ollama_model is not None:
+        candidate['ollama_model'] = ollama_model
+    if stop_words is not None:
+        candidate['stop_words'] = stop_words
+    if microphone != 'unchanged':
+        candidate['microphone'] = microphone
+    if energy_threshold is not None:
+        candidate['energy_threshold'] = energy_threshold
+    if continuous_dialogue is not None:
+        candidate['continuous_dialogue'] = continuous_dialogue
+    if character_voice is not None:
+        candidate['character_voice'] = character_voice
+    if japanese_catchphrases is not None:
+        candidate['japanese_catchphrases'] = japanese_catchphrases
     try:
-        with open(get_settings_file(), 'w', encoding='utf-8') as f:
-            json.dump(_runtime, f, ensure_ascii=False, indent=2)
+        write_json(get_settings_file(), candidate)
+        _runtime = candidate
         return True
     except Exception:
         return False
@@ -379,6 +503,10 @@ def get_stop_words():
 
 def get_tts_engine():
     return _runtime.get('tts_engine', 'vits')
+
+
+def get_character_voice():
+    return dict(_runtime.get('character_voice', {}))
 
 
 def get_tts_voice():
@@ -410,230 +538,27 @@ def get_tts_azure_voice():
 
 
 def show_settings():
-    """设置窗口：唤醒词、灵敏度、TTS 引擎、模型（内容超出时支持上下滚动）"""
-    def _build():
-        try:
-            import tkinter as tk
-            from tkinter import ttk, messagebox
-
-            root = tk.Tk()
-            root.title('设置')
-            root.geometry('520x560')
-            root.resizable(True, True)
-            root.minsize(420, 360)
-            root.attributes('-topmost', True)
-            root.configure(bg='#f5f7fa')
-
-            tk.Label(root, text='设置', font=('Microsoft YaHei', 14, 'bold'), bg='#f5f7fa').pack(pady=(16, 8))
-
-            # 滚动容器：内容较多时上下滚动，避免被窗口边界裁切
-            canvas = tk.Canvas(root, bg='#f5f7fa', highlightthickness=0)
-            scroll = tk.Scrollbar(root, orient='vertical', command=canvas.yview)
-            canvas.configure(yscrollcommand=scroll.set)
-            canvas.pack(side='left', fill='both', expand=True, padx=(16, 0))
-            scroll.pack(side='right', fill='y')
-
-            content = tk.Frame(canvas, bg='#f5f7fa')
-            canvas.create_window((0, 0), window=content, anchor='nw')
-
-            def _on_content_configure(event):
-                canvas.configure(scrollregion=canvas.bbox('all'))
-
-            content.bind('<Configure>', _on_content_configure)
-
-            def _on_mousewheel(event):
-                canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
-
-            canvas.bind_all('<MouseWheel>', _on_mousewheel)
-
-            f1 = tk.Frame(content, bg='#f5f7fa')
-            f1.pack(fill='x', padx=16, pady=6)
-            tk.Label(f1, text='唤醒词（逗号分隔）', bg='#f5f7fa').pack(anchor='w')
-            wake_entry = tk.Entry(f1, font=('Microsoft YaHei', 10))
-            wake_entry.pack(fill='x', ipady=3)
-            wake_entry.insert(0, '，'.join(_runtime['wake_words']))
-
-            f2 = tk.Frame(content, bg='#f5f7fa')
-            f2.pack(fill='x', padx=16, pady=6)
-            tk.Label(f2, text='唤醒灵敏度 (0.1~1.0，越低越宽松)', bg='#f5f7fa').pack(anchor='w')
-            sens_entry = tk.Entry(f2, font=('Microsoft YaHei', 10))
-            sens_entry.pack(fill='x', ipady=3)
-            sens_entry.insert(0, str(_runtime['sensitivity']))
-
-            f3 = tk.Frame(content, bg='#f5f7fa')
-            f3.pack(fill='x', padx=16, pady=6)
-            tk.Label(f3, text='语音引擎（TTS）：vits=本地离线(零延迟) / edge=联网免费 / pyttsx3=系统机械音 / azure=需卡号', bg='#f5f7fa').pack(anchor='w')
-            tts_combo = ttk.Combobox(f3, values=['vits', 'edge', 'pyttsx3', 'azure', 'auto'], state='readonly')
-            tts_combo.pack(fill='x')
-            tts_combo.set(_runtime.get('tts_engine', 'vits'))
-
-            f3b = tk.Frame(content, bg='#f5f7fa')
-            f3b.pack(fill='x', padx=16, pady=6)
-            tk.Label(f3b, text='声音角色（edge 引擎时生效）', bg='#f5f7fa').pack(anchor='w')
-            voice_combo = ttk.Combobox(f3b, values=list(VOICE_OPTIONS.keys()), state='readonly')
-            voice_combo.pack(fill='x')
-            cur_voice_id = _runtime.get('tts_voice', 'zh-CN-XiaoxiaoNeural')
-            cur_voice_name = '晓晓（女，温柔）'
-            for name, vid in VOICE_OPTIONS.items():
-                if vid == cur_voice_id:
-                    cur_voice_name = name
-                    break
-            voice_combo.set(cur_voice_name)
-
-            # ---- Edge 感情风格 / 语速 / 音调（GUI 可调） ----
-            from src.feedback import EDGE_STYLE_OPTIONS
-            f3c = tk.Frame(content, bg='#f5f7fa')
-            f3c.pack(fill='x', padx=16, pady=6)
-            tk.Label(f3c, text='感情风格（edge/azure 在线引擎时生效）', bg='#f5f7fa').pack(anchor='w')
-            style_combo = ttk.Combobox(f3c, values=list(EDGE_STYLE_OPTIONS.keys()), state='readonly')
-            style_combo.pack(fill='x')
-            cur_style = _runtime.get('tts_style', 'calm')
-            cur_style_name = '平静慵懒 (calm)'
-            for name, sid in EDGE_STYLE_OPTIONS.items():
-                if sid == cur_style:
-                    cur_style_name = name
-                    break
-            style_combo.set(cur_style_name)
-
-            f3d = tk.Frame(content, bg='#f5f7fa')
-            f3d.pack(fill='x', padx=16, pady=6)
-            tk.Label(f3d, text='语速（edge/azure 在线引擎时生效，负=慢，正=快）', bg='#f5f7fa').pack(anchor='w')
-            rate_combo = ttk.Combobox(f3d, state='readonly', values=[
-                '-20%', '-15%', '-12%', '-8%', '-5%', '0%', '+5%', '+10%', '+15%', '+20%'
-            ])
-            rate_combo.pack(fill='x')
-            rate_combo.set(_runtime.get('tts_rate', '-5%'))
-
-            f3e = tk.Frame(content, bg='#f5f7fa')
-            f3e.pack(fill='x', padx=16, pady=6)
-            tk.Label(f3e, text='音调（edge/azure 在线引擎时生效，负=低，正=高）', bg='#f5f7fa').pack(anchor='w')
-            pitch_combo = ttk.Combobox(f3e, state='readonly', values=[
-                '-10Hz', '-6Hz', '-3Hz', '+0Hz', '+3Hz', '+6Hz', '+10Hz'
-            ])
-            pitch_combo.pack(fill='x')
-            pitch_combo.set(_runtime.get('tts_pitch', '+0Hz'))
-
-            # ---- Azure(微软)语音合成：国内 azure.cn 节点、音质高，需订阅密钥 ----
-            f3f = tk.Frame(content, bg='#f5f7fa')
-            f3f.pack(fill='x', padx=16, pady=6)
-            tk.Label(f3f, text='Azure 语音订阅密钥（可选：需信用卡注册 Azure 并开通「语音服务」；留空则用免费 edge 引擎）',
-                     bg='#f5f7fa').pack(anchor='w')
-            azure_key_entry = tk.Entry(f3f, font=('Microsoft YaHei', 10), show='*')
-            azure_key_entry.pack(fill='x', ipady=3)
-            azure_key_entry.insert(0, _runtime.get('tts_azure_key', ''))
-
-            f3g = tk.Frame(content, bg='#f5f7fa')
-            f3g.pack(fill='x', padx=16, pady=6)
-            tk.Label(f3g, text='Azure 区域（如 chinaeast2 / chinanorth，需与订阅资源一致）',
-                     bg='#f5f7fa').pack(anchor='w')
-            azure_region_entry = tk.Entry(f3g, font=('Microsoft YaHei', 10))
-            azure_region_entry.pack(fill='x', ipady=3)
-            azure_region_entry.insert(0, _runtime.get('tts_azure_region', 'chinaeast2'))
-
-            f3h = tk.Frame(content, bg='#f5f7fa')
-            f3h.pack(fill='x', padx=16, pady=6)
-            tk.Label(f3h, text='Azure 音色（如 zh-CN-XiaoxiaoNeural / zh-CN-YunxiNeural）',
-                     bg='#f5f7fa').pack(anchor='w')
-            azure_voice_entry = tk.Entry(f3h, font=('Microsoft YaHei', 10))
-            azure_voice_entry.pack(fill='x', ipady=3)
-            azure_voice_entry.insert(0, _runtime.get('tts_azure_voice', 'zh-CN-XiaoxiaoNeural'))
-
-
-            f4 = tk.Frame(content, bg='#f5f7fa')
-            f4.pack(fill='x', padx=16, pady=6)
-            tk.Label(f4, text='大模型（Ollama）', bg='#f5f7fa').pack(anchor='w')
-            model_row = tk.Frame(f4, bg='#f5f7fa')
-            model_row.pack(fill='x')
-            model_combo = ttk.Combobox(model_row, state='readonly')
-            model_combo.pack(side='left', fill='x', expand=True)
-
-            def _refresh_models():
-                model_combo['values'] = list_ollama_models()
-                if model_combo['values']:
-                    model_combo.current(0)
-            tk.Button(model_row, text='刷新', command=_refresh_models).pack(side='left', padx=6)
-            _refresh_models()
-            cur_model = load_selected_model()
-            if cur_model and cur_model in model_combo['values']:
-                model_combo.set(cur_model)
-
-            def apply():
-                """应用设置并保存，返回是否成功"""
-                ww = [w.strip() for w in wake_entry.get().replace('，', ',').split(',') if w.strip()]
-                if not ww:
-                    messagebox.showwarning('提示', '唤醒词不能为空', parent=root)
-                    return False
-                try:
-                    sens = float(sens_entry.get())
-                    if not (0.0 < sens <= 1.0):
-                        raise ValueError
-                except Exception:
-                    messagebox.showwarning('提示', '灵敏度需为 0~1 之间的数字', parent=root)
-                    return False
-                tts = tts_combo.get() or 'edge'
-                voice_name = voice_combo.get()
-                voice = VOICE_OPTIONS.get(voice_name, 'zh-CN-XiaoxiaoNeural')
-                style_name = style_combo.get()
-                style = EDGE_STYLE_OPTIONS.get(style_name, 'calm')
-                rate = rate_combo.get() or '-5%'
-                pitch = pitch_combo.get() or '+0Hz'
-                model = model_combo.get()
-                azure_key = azure_key_entry.get().strip()
-                azure_region = azure_region_entry.get().strip() or 'chinaeast2'
-                azure_voice = azure_voice_entry.get().strip() or 'zh-CN-XiaoxiaoNeural'
-                save_settings(ww, sens, tts, voice, style, rate, pitch,
-                              tts_azure_key=azure_key, tts_azure_region=azure_region,
-                              tts_azure_voice=azure_voice)
-                if model:
-                    save_selected_model(model)
-                try:
-                    from src.feedback import configure_tts
-                    configure_tts(tts, voice, style, rate, pitch,
-                                  azure_key=azure_key, azure_region=azure_region,
-                                  azure_voice=azure_voice)
-                except Exception:
-                    pass
-                try:
-                    from src.executor import configure_ollama
-                    configure_ollama(model if model else None)
-                except Exception:
-                    pass
-                return True
-
-            def save_and_close():
-                if apply():
-                    messagebox.showinfo('成功', '设置已保存并生效', parent=root)
-                    root.destroy()
-
-            def on_close():
-                # 点窗口 X 关闭时提示保存，避免设置被"重置"
-                if messagebox.askyesno('提示', '要保存设置吗？', parent=root):
-                    if apply():
-                        root.destroy()
-                else:
-                    root.destroy()
-
-            tk.Button(content, text='保存并应用', command=save_and_close, bg='#4CAF50', fg='white',
-                      font=('Microsoft YaHei', 11, 'bold'), width=16).pack(pady=14)
-
-            root.protocol('WM_DELETE_WINDOW', on_close)
-            root.mainloop()
-        except Exception as e:
-            print(f'[GUI] 设置窗口失败: {e}')
-
-    threading.Thread(target=_build, daemon=True, name='settings-ui').start()
+    if _ui is None:
+        return
+    def open_once():
+        _ui.root.deiconify()
+        if _ui._settings is not None and _ui._settings.winfo_exists():
+            _ui._settings.lift()
+        else:
+            from src.settings_ui import SettingsWindow
+            dialog = SettingsWindow(_ui)
+            _ui._settings = dialog.window
+    _ui._post(open_once)
 
 
 _ui = None
 
 
-def start_main_window():
-    """启动主窗口（后台线程，不阻塞主循环）"""
+def start_main_window(on_submit=None, on_pause=None, on_retry=None, on_speak=None):
+    """Create the window on the process main thread."""
     global _ui
-    if _ui is not None:
-        return
-    _ui = MainWindow()
-    threading.Thread(target=_ui.run, daemon=True, name='main-ui').start()
+    _ui = MainWindow(on_submit, on_pause, on_retry, on_speak)
+    return _ui
 
 
 def show_window():
@@ -661,3 +586,8 @@ def append_output(text):
 def append_system(text):
     if _ui:
         _ui.append_system(text)
+
+
+def stream_output(piece):
+    if _ui:
+        _ui.stream_output(piece)

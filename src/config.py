@@ -28,25 +28,20 @@ def _resolve_relative(path):
 
 
 def _resolve_log_file(path):
-    """日志文件写入可写目录：源码运行 -> 项目根；打包运行 -> exe 所在目录"""
+    from src.storage import data_directory
     if not path:
         return path
-    if os.path.isabs(path):
-        return os.path.normpath(path)
-    if getattr(sys, 'frozen', False):
-        base = os.path.dirname(os.path.abspath(sys.executable))
-    else:
-        base = get_resource_root()
-    return os.path.normpath(os.path.join(base, path))
+    return os.path.normpath(path if os.path.isabs(path) else os.path.join(data_directory(), path))
 
 
 DEFAULT_CONFIG = {
-    'wake_words': ['你好小猪'],
+    'wake_words': ['你好黑猫', '黑猫'],
     'language': 'zh-CN',
     'tts_engine': 'pyttsx3',
     'intents_path': _resolve_relative('data/intents.json'),
     'plugin_path': _resolve_relative('plugins'),
-    'log_file': os.path.join(get_resource_root(), 'assistant.log'),
+    'log_file': _resolve_log_file('assistant.log'),
+    'speech_model_path': _resolve_relative('models/sense_voice'),
     'app_map_path': _resolve_relative('config/app_map.json'),
 }
 
@@ -76,6 +71,8 @@ def load_config(path=None):
                 user_cfg = yaml.safe_load(f) or {}
             else:
                 user_cfg = json.load(f) or {}
+        if not isinstance(user_cfg, dict):
+            user_cfg = {}
         print("Config loaded from file")
     except Exception as e:
         print(f"Config load error: {e}")

@@ -21,6 +21,10 @@ class IntentParser:
             return json.load(f)
 
     def parse(self, text):
+        from .nlu.commands import parse_command
+        parsed = parse_command(text)
+        if parsed is not None:
+            return parsed
         text = text.strip().lower()
 
         for intent in self.intents:

@@ -1,0 +1,10 @@
+{
+  "version": "0.0.9",
+  "engine": "edge",
+  "ok": true,
+  "audio_bytes": 11952,
+  "fallback": false,
+  "automatic_playback": false,
+  "tests_passed": 44,
+  "zip_sha256": "c5d1894c93e09c16d5067169e948c29687016bf4732bf054184abbc7f40c34aa"
+}

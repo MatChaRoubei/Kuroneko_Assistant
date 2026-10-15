@@ -26,9 +26,8 @@ _setup_import_paths()
 IS_WINDOWED = getattr(sys, 'frozen', False)
 
 if IS_WINDOWED:
-    _log_path = os.path.join(
-        os.path.dirname(os.path.abspath(sys.executable)), 'console.log'
-    )
+    from src.storage import user_file
+    _log_path = user_file('diagnostics_console.log' if '--debug' in sys.argv else 'console.log')
     try:
         # 用 'w' 截断而非 'a' 追加：避免反复启动无限累积（旧版曾涨到数百 MB）
         _log_f = open(_log_path, 'w', encoding='utf-8', buffering=1)
@@ -37,12 +36,17 @@ if IS_WINDOWED:
         _orig_stderr = sys.stderr
 
         class _Tee:
+            encoding = 'utf-8'
+
             def __init__(self, orig, logf):
                 self._orig = orig
                 self._logf = logf
 
             def write(self, s):
                 try:
+                    if self._logf.tell() > 2 * 1024 * 1024:
+                        self._logf.seek(0)
+                        self._logf.truncate()
                     self._logf.write(s)
                 except Exception:
                     pass
@@ -54,360 +58,303 @@ if IS_WINDOWED:
                 except Exception:
                     pass
 
+            def isatty(self):
+                return False
+
         sys.stdout = _Tee(_orig_stdout, _log_f)
         sys.stderr = _Tee(_orig_stderr, _log_f)
     except Exception:
         pass
 
-# 杀空间模块：导入即把临时目录重定向到 D 盘，并提供清理函数
-from src.cleaner import (
-    cleanup_temp_files,
-    start_periodic_cleanup,
-    cleanup_now,
-)
-
-
-# 统一使用 src 包绝对导入，兼容源码运行与打包运行
-from src.config import load_config
-from src.executor import execute_intent, configure_ollama
-from src.feedback import say, notify, configure_tts, warmup_tts, say_sync, wait_speaking_done, say_wake
-from src.stop import begin_output, end_output, start_stop_listener, start_barge_in_listener, request_stop, is_stop_requested
-from src.intents import IntentParser
-from src.logger import configure_logging, get_logger
-from src.plugins import PluginManager
-from src.recognize import SpeechRecognizer, SherpaONNXRecognizer, check_speech_dependencies, match_phrase
-from src.nlu.phonetic_corrector import PhoneticCorrector
-from src.nlu.fuzzy_regex import FuzzyRegexMatcher
-from src.tray import start_tray
-from src.gui import load_selected_model, append_asr, append_output, set_status, start_main_window, load_settings, get_wake_words, get_tts_engine, get_tts_voice, get_sensitivity, get_stop_words, get_tts_style, get_tts_rate, get_tts_pitch, get_tts_azure_key, get_tts_azure_region, get_tts_azure_voice
-
-# 打断（barge-in）总开关：播放/生成期间主人开口即中断当前播报。
-# 设为 False 可关闭（仅保留停止词中断）。后续可接入 settings.json 由 GUI 控制。
-BARGE_IN_ENABLED = True
+import queue
+import threading
+import time
+from src.lifecycle import shutdown, voice_paused, capture_cancelled, busy, request_exit, cancel_capture
+from src.gui import (start_main_window, load_settings, load_selected_model, get_wake_words,
+                     get_sensitivity, get_stop_words, append_asr, append_output, append_system, set_status)
 
 
 def create_recognizer(cfg):
-    """根据配置创建语音识别器，自动检测可用引擎"""
-    import os
-
-    # 获取模型路径（支持绝对路径和相对路径）
-    model_path = cfg.get('speech_model_path', '../models/sense_voice')
-    if not os.path.isabs(model_path):
-        model_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), model_path)
-
-    # 优先使用 INT8/Q8 量化版本
-    model_file = None
-    for m in ['model.int8.onnx', 'model_q8.onnx', 'model.onnx']:
-        candidate = os.path.join(model_path, m)
-        if os.path.exists(candidate):
-            model_file = candidate
-            break
-
-    # 查找 tokens 文件
-    tokens_file = None
-    for t in ['tokens.txt', 'tokens (1).txt']:
-        candidate = os.path.join(model_path, t)
-        if os.path.exists(candidate):
-            tokens_file = candidate
-            break
-
-    # 自动检测：优先使用本地 sherpa-onnx
-    if model_file and tokens_file:
+    from src.recognize import SpeechRecognizer, SherpaONNXRecognizer, resolve_microphone
+    from src.gui import _runtime
+    device = resolve_microphone(_runtime.get('microphone'))
+    threshold = _runtime.get('energy_threshold', cfg.get('energy_threshold', 0.02))
+    model_path = cfg['speech_model_path']
+    if cfg.get('speech_engine') != 'google' and os.path.isfile(os.path.join(model_path, 'tokens.txt')):
         try:
-            engine = cfg.get('speech_engine', 'auto')
-            if engine == 'google':
-                print('强制使用 Google STT（需要网络）')
-                return SpeechRecognizer(language=cfg.get('language', 'zh-CN'))
-            print('自动选择：sherpa-onnx 本地离线识别')
-            return SherpaONNXRecognizer(
-                model_path=model_path,
-                energy_threshold=cfg.get('energy_threshold', 0.02),
-            )
-        except Exception as e:
-            print(f'sherpa-onnx 初始化失败: {e}，回退到 Google STT')
-            return SpeechRecognizer(language=cfg.get('language', 'zh-CN'))
-    else:
-        print('未检测到 sherpa-onnx 模型，自动使用 Google STT（需要网络）')
-        return SpeechRecognizer(language=cfg.get('language', 'zh-CN'))
+            return SherpaONNXRecognizer(model_path=model_path, energy_threshold=threshold, device=device)
+        except Exception as exc:
+            append_system(f'本地语音识别暂不可用，尝试在线识别：{exc}')
+    append_system('正在使用在线语音识别，需要网络；离线识别请安装本地语音模型。')
+    return SpeechRecognizer(language=cfg.get('language', 'zh-CN'), device=device, energy_threshold=threshold)
+
+
+class Assistant:
+    def __init__(self):
+        self.commands = queue.Queue(maxsize=1)
+        self.ready = threading.Event()
+        self.retry_microphone = threading.Event()
+        self.recognizer = None
+        self.voice_error = ''
+        self.single_utterance = threading.Event()
+        self.followup_until = 0
+        self.last_input_source = 'text'
+        self.ui = start_main_window(self.submit, self.update_status, self.retry, self.speak_once)
+
+    def submit(self, query, source='text'):
+        if not self.ready.is_set() or busy.is_set() or shutdown.is_set():
+            return False
+        # Reserve execution immediately; rapid Enter presses cannot duplicate work.
+        busy.set()
+        self.last_input_source = source
+        # Start the cancellation lifetime at acceptance. A Stop click before
+        # the worker dequeues the command must not be cleared by that worker.
+        from src.stop import begin_output
+        begin_output()
+        cancel_capture()
+        self.ui.set_busy(True)
+        self.commands.put_nowait(query)
+        return True
+
+    def speak_once(self):
+        if not self.ready.is_set() or busy.is_set() or self.single_utterance.is_set():
+            return False
+        self.single_utterance.set()
+        cancel_capture()
+        if self.recognizer is None:
+            self.retry_microphone.set()
+        set_status('正在准备单次说话…')
+        return True
+
+    def retry(self):
+        self.retry_microphone.set()
+        cancel_capture()
+        set_status('正在重新检测麦克风… · 文字输入仍可使用')
+
+    def update_status(self):
+        if busy.is_set():
+            return
+        if voice_paused.is_set():
+            set_status('监听已暂停 · 可继续输入文字')
+        elif self.voice_error:
+            set_status('文字模式 · 点击“重试麦克风”可恢复语音')
+        else:
+            set_status(f'监听中 · 说“{get_wake_words()[0]} + 指令”或直接输入')
+
+    def initialize(self):
+        try:
+            set_status('正在加载指令和设置…')
+            from src.config import load_config
+            from src.logger import configure_logging, get_logger
+            from src.executor import load_app_map, configure_ollama
+            from src.feedback import configure_tts, warmup_tts
+            from src.gui import (get_tts_engine, get_tts_voice, get_tts_style, get_tts_rate,
+                                 get_tts_pitch, get_tts_azure_key, get_tts_azure_region, get_tts_azure_voice)
+            from src.gui import get_character_voice
+            from src.intents import IntentParser
+            from src.plugins import PluginManager
+            self.cfg = load_config()
+            from src.storage import migrate_legacy_settings
+            migrate_legacy_settings()
+            load_settings(self.cfg)
+            configure_logging(self.cfg['log_file'])
+            self.logger = get_logger()
+            configure_tts(get_tts_engine(), get_tts_voice(), get_tts_style(), get_tts_rate(), get_tts_pitch(),
+                          azure_key=get_tts_azure_key(), azure_region=get_tts_azure_region(), azure_voice=get_tts_azure_voice(),
+                          character_profile=get_character_voice())
+            configure_ollama(load_selected_model(self.cfg.get('ollama_model')))
+            self.parser = IntentParser(self.cfg['intents_path'])
+            self.plugins = PluginManager(self.cfg['plugin_path'])
+            load_app_map(self.cfg['app_map_path'])
+            self.corrector = None
+            self.fuzzy = None
+            if self.cfg.get('enable_asr_correction', True):
+                try:
+                    from src.nlu.phonetic_corrector import PhoneticCorrector
+                    from src.executor import APP_MAP
+                    self.corrector = PhoneticCorrector(self.cfg['intents_path'], app_names=list(APP_MAP))
+                except Exception as exc:
+                    self.logger.warning('纠错模块不可用: %s', exc)
+            if self.cfg.get('nlu_engine') == 'fuzzy_regex':
+                from src.nlu.fuzzy_regex import FuzzyRegexMatcher
+                self.fuzzy = FuzzyRegexMatcher(self.cfg['intents_path'])
+            self.ready.set()
+            self.ui.set_ready()
+            set_status('文字输入已就绪 · 正在准备语音识别…')
+            threading.Thread(target=self.execute_loop, daemon=True, name='commands').start()
+            threading.Thread(target=self.voice_loop, daemon=True, name='voice').start()
+            if voice_paused.is_set():
+                self.update_status()
+            # Model warmup and application discovery never delay a usable window.
+            warmup_tts()
+            from src.executor import scan_all_program_folders
+            threading.Thread(target=scan_all_program_folders, daemon=True, name='app-index').start()
+            from src.cleaner import start_periodic_cleanup
+            start_periodic_cleanup()
+            from src.reminders import get_reminders
+            get_reminders()
+        except Exception as exc:
+            append_system(f'初始化失败：{exc}。可从托盘运行诊断。')
+            set_status('启动遇到问题 · 请运行诊断查看详情')
+            import traceback
+            traceback.print_exc()
+
+    def voice_loop(self):
+        from src.feedback import wait_speaking_done, say_wake
+        from src.recognize import capture_context
+        from src.lifecycle import capture_should_stop
+        while not shutdown.is_set():
+            manual = self.single_utterance.is_set()
+            if busy.is_set() or (voice_paused.is_set() and not manual):
+                shutdown.wait(0.1)
+                continue
+            if self.recognizer is None or self.retry_microphone.is_set():
+                self.retry_microphone.clear()
+                try:
+                    self.recognizer = create_recognizer(self.cfg)
+                    self.voice_error = ''
+                except Exception as exc:
+                    self.recognizer = None
+                    self.voice_error = str(exc)
+                    self.single_utterance.clear()
+                    append_system(f'语音暂不可用：{exc}。您可以继续输入文字，连接麦克风后点击重试。')
+                    self.update_status()
+                    while not shutdown.is_set() and not self.retry_microphone.wait(0.2):
+                        pass
+                    continue
+            capture_cancelled.clear()
+            if busy.is_set() or (voice_paused.is_set() and not manual):
+                continue
+            wait_speaking_done()
+            if shutdown.is_set():
+                return
+            self.update_status()
+            try:
+                capture_context.manual = manual
+                def on_wake():
+                    set_status('已唤醒 · 请说指令')
+                    say_wake()
+                followup = time.monotonic() < self.followup_until
+                if manual or followup:
+                    self.single_utterance.clear()
+                    self.ui.set_capturing(True)
+                    set_status('请直接说指令，说完会自动结束。' if manual else '连续对话中 · 可直接说下一句，8 秒静音后结束')
+                    ok, query = self.recognizer.listen_once(timeout=5 if manual else 8, phrase_time_limit=15)
+                    self.followup_until = 0
+                else:
+                    ok, query = self.recognizer.listen_with_kws(get_wake_words(), on_wake=on_wake, sensitivity=get_sensitivity())
+                if capture_cancelled.is_set() or shutdown.is_set():
+                    continue
+                if ok and query:
+                    self.submit(query, source='voice')
+                elif query and '未检测' not in query and '取消' not in query:
+                    self.logger.warning('语音监听: %s', query)
+                    if '录音' in query or 'PortAudio' in query:
+                        self.recognizer = None
+                    shutdown.wait(0.5)
+            except Exception as exc:
+                self.logger.warning('语音监听异常: %s', exc)
+                self.recognizer = None
+                shutdown.wait(1)
+            finally:
+                capture_context.manual = False
+                self.ui.set_capturing(False)
+                if not busy.is_set():
+                    self.update_status()
+
+    def execute_loop(self):
+        from src.executor import execute_intent, SYSTEM_PANEL_COMMANDS
+        from src.recognize import is_stop_command
+        from src.feedback import say, wait_speaking_done
+        from src.stop import begin_output, end_output, start_stop_listener, is_stop_requested
+        while not shutdown.is_set():
+            try:
+                query = self.commands.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            allow_followup = True
+            try:
+                if is_stop_requested():
+                    append_system('已取消这条指令。')
+                    continue
+                append_asr(query)
+                if query in ('退出', '关闭', '拜拜'):
+                    request_exit()
+                    continue
+                if is_stop_command(query, get_stop_words()):
+                    append_system('已停止，等待下一条指令。')
+                    continue
+                set_status('正在处理… · 按 Esc 可停止回答')
+                if self.corrector:
+                    query = self.corrector.correct(query)
+                name, slots = self.fuzzy.match(query) if self.fuzzy else self.parser.parse(query)
+                if name == 'unknown':
+                    name, slots = self.parser.parse(query)
+                if name == 'open_app' and slots.get('app_name') in SYSTEM_PANEL_COMMANDS:
+                    name, slots = 'open_system_panel', {'panel': slots['app_name']}
+                if name == 'dialogue_mode':
+                    from src.gui import _runtime
+                    enabled = slots['enabled']
+                    _runtime['continuous_dialogue'] = enabled
+                    allow_followup = enabled
+                    self.followup_until = time.monotonic() + 8 if enabled else 0
+                    append_output('已开启连续对话。每次回复后可直接说下一句。' if enabled else '已结束连续对话，下一条语音指令需要唤醒词。')
+                    continue
+                # One input owner at a time. Energy-only barge-in mistakes speaker
+                # echo for speech and sd.rec can stop sd.play, so use stop words.
+                if name == 'unknown' and self.recognizer and not voice_paused.is_set():
+                    # Let the normal capture loop release its stream first.
+                    from src.recognize import capture_lock
+                    with capture_lock:
+                        capture_cancelled.clear()
+                        start_stop_listener(True, self.recognizer, get_stop_words())
+                plugin_ok, plugin_result = self.plugins.try_execute(name, slots)
+                result = (True, str(plugin_result)) if plugin_ok else execute_intent(name, slots, query)
+                success, message = result[:2]
+                streamed = len(result) > 2 and result[2]
+                append_output(message if success else '执行失败：' + message)
+                if not streamed and not is_stop_requested():
+                    say(message)
+                set_status('正在播报… · 按 Esc 可停止' if not is_stop_requested() else '已停止回答')
+                wait_speaking_done()
+            except Exception as exc:
+                self.logger.exception('指令处理失败')
+                append_output(f'处理失败：{exc}')
+            finally:
+                end_output()
+                self.commands.task_done()
+                busy.clear()
+                self.ui.set_busy(False)
+                from src.gui import _runtime
+                if allow_followup and not is_stop_requested() and getattr(self, 'last_input_source', 'text') == 'voice' and _runtime.get('continuous_dialogue') and not voice_paused.is_set():
+                    self.followup_until = time.monotonic() + 8
+                self.update_status()
 
 
 def main():
-    cleanup_temp_files()
-    start_periodic_cleanup()
-    cfg = load_config()
-    # 读取用户设置（唤醒词、灵敏度、TTS 引擎）
-    load_settings()
-    # 配置 TTS 引擎（含感情风格/语速/音调，均来自 GUI 设置）
-    configure_tts(get_tts_engine(), get_tts_voice(),
-                  get_tts_style(), get_tts_rate(), get_tts_pitch(),
-                  azure_key=get_tts_azure_key(), azure_region=get_tts_azure_region(),
-                  azure_voice=get_tts_azure_voice())
-    warmup_tts()
-    configure_ollama(load_selected_model() or cfg.get('ollama_model'))
-    configure_logging(cfg.get('log_file'))
-    logger = get_logger()
-
-    parser = IntentParser(cfg.get('intents_path'))
-    plugin_manager = PluginManager(cfg.get('plugin_path'))
-
-    from src.executor import load_app_map
-    load_app_map(cfg.get('app_map_path'))
-
-    # 初始化增强 NLU 组件
-    corrector = None
-    fuzzy_matcher = None
-    if cfg.get('enable_asr_correction', True):
-        try:
-            from src.executor import APP_MAP as _APP_MAP
-            corrector = PhoneticCorrector(
-                intents_path=cfg.get('intents_path'),
-                app_names=list(_APP_MAP.keys())
-            )
-            logger.info('ASR 纠错模块初始化成功')
-        except Exception as e:
-            logger.warning(f'ASR 纠错模块初始化失败: {e}')
-
-    if cfg.get('nlu_engine') == 'fuzzy_regex':
-        try:
-            fuzzy_matcher = FuzzyRegexMatcher(cfg.get('intents_path'))
-            logger.info('FuzzyRegex 匹配器初始化成功')
-        except Exception as e:
-            logger.warning(f'FuzzyRegex 匹配器初始化失败: {e}')
-
-    # 初始化唤醒词检测器（VAD）
-    wake_word_detector = None
-    if cfg.get('enable_wake_word_detector', True):
-        try:
-            from src.nlu.wake_word_detector import create_wake_word_detector
-            wake_word_detector = create_wake_word_detector(cfg)
-            logger.info('唤醒词检测器初始化成功')
-        except Exception as e:
-            logger.warning(f'唤醒词检测器初始化失败: {e}')
-
-    # 扫描本地程序目录并更新 APP_MAP
-    from src.executor import scan_all_program_folders
+    # Import lightweight UI first; dependency/model loading happens after paint.
+    from src.instance import SingleInstance
+    instance = SingleInstance()
+    if not instance.acquire():
+        return
+    if '--text-only' in sys.argv:
+        voice_paused.set()
+    app = Assistant()
+    instance.watch(app.ui.show)
+    from src.tray import start_tray, stop_tray
+    app.ui._tray_available = start_tray() is not None
+    threading.Thread(target=app.initialize, daemon=True, name='initialize').start()
     try:
-        scanned = scan_all_program_folders()
-        logger.info(f'扫描到 {len(scanned)} 个本地应用程序')
-    except Exception as e:
-        logger.warning(f'扫描本地应用程序失败: {e}')
-        scanned = []
+        app.ui.run()
+    finally:
+        request_exit()
+        stop_tray()
+        instance.close()
 
-    dep_ok, dep_msg = check_speech_dependencies()
-    voice_available = dep_ok
-    recognizer = None
-    # 延迟初始化语音识别器，避免启动卡住
-    # if voice_available:
-    #     try:
-    #         recognizer = SpeechRecognizer(language=cfg.get('language', 'zh-CN'))
-    #         logger.info('语音识别模块初始化成功')
-    #     except Exception as e:
-    #         voice_available = False
-    #         logger.warning(f'语音识别初始化失败: {e}')
-
-    if not voice_available:
-        logger.warning('语音识别不可用: ' + dep_msg)
-
-    logger.info('语音助手启动完成')
-
-    # 启动时直接初始化语音识别器
-    if voice_available:
-        try:
-            recognizer = create_recognizer(cfg)
-            logger.info('语音识别模块初始化成功')
-        except Exception as e:
-            logger.warning(f'语音识别初始化失败: {e}')
-            try:
-                from src.recognize import SpeechRecognizer
-                recognizer = SpeechRecognizer(language=cfg.get('language', 'zh-CN'))
-                logger.info('Google STT 初始化成功')
-            except Exception as e2:
-                logger.warning(f'Google STT 初始化失败: {e2}')
-                recognizer = None
-
-    # 直接进入语音模式
-    logger.info('已进入语音模式')
-    use_voice = True
-
-    # 启动系统托盘图标（显示运行状态，右键可退出）
-    start_tray()
-
-    # 启动主窗口（展示识别内容和输出内容）
-    start_main_window()
-    set_status('● 监听中，说「你好黑猫」唤醒')
-
-    while True:
-        try:
-            if use_voice:
-                # 等待上一轮播报结束，避免助手自己的声音（回声）被麦克风录入
-                wait_speaking_done()
-
-                if not voice_available or recognizer is None:
-                    logger.warning('语音识别功能不可用')
-                    say('语音识别不可用')
-                    if IS_WINDOWED:
-                        # 无控制台无法文本输入，稍作等待后重试语音初始化
-                        import time as _time
-                        _time.sleep(5)
-                        continue
-                    use_voice = False
-                    continue
-
-                # 优先使用专用唤醒词检测器（VAD）
-                if wake_word_detector is not None:
-                    ok, _ = recognizer.listen_await_wake_word(wake_word_detector)
-                    if ok:
-                        # VAD 检测到语音，唤醒成功，继续监听实际指令
-                        say('我在')
-                        # 等"我在"播完再录音，避免把助手自己的声音录进去（回声）
-                        wait_speaking_done()
-                        ok, query = recognizer.listen_once()
-                        if not ok:
-                            logger.warning(f'语音识别失败: {query}')
-                            continue
-                    else:
-                        # 唤醒词检测超时，继续循环等待
-                        continue
-                else:
-                    # 持续监听：听到唤醒词才反应（唤醒瞬间播报"我在"）
-                    ok, query = recognizer.listen_with_kws(
-                        get_wake_words(),
-                        on_wake=lambda: (say_wake(), set_status('● 已唤醒，请说指令')),
-                        sensitivity=get_sensitivity(),
-                    )
-                    if not ok:
-                        logger.warning(f'语音识别失败: {query}')
-                        continue
-                logger.info('识别内容：%s', query)
-                append_asr(query)
-            else:
-                if IS_WINDOWED:
-                    # 无控制台无法文本输入，强制回到语音监听
-                    use_voice = True
-                    continue
-                query = input('请输入指令：').strip()
-
-            if not query:
-                continue
-
-            if query in ('0', '1'):
-                use_voice = (query == '1')
-                if use_voice and voice_available and recognizer is None:
-                    try:
-                        recognizer = create_recognizer(cfg)
-                        logger.info(f'语音识别模块初始化成功 (引擎: {cfg.get("speech_engine", "google")})')
-                    except Exception as e:
-                        voice_available = False
-                        logger.warning(f'语音识别初始化失败: {e}')
-                        say('语音识别初始化失败，请使用文本输入')
-                        use_voice = False
-                        continue
-                logger.info(f'输入模式切换为: {"语音" if use_voice else "文本"}')
-                say('已切换为' + ('语音' if use_voice else '文本') + '模式')
-                continue
-
-            if query in ('退出', '关闭', '拜拜'):
-                say('再见')
-                break
-
-            # 停止词：重新监听（不退出程序，也不执行指令）
-            hit_stop, sw = match_phrase(query, get_stop_words())
-            if hit_stop:
-                logger.info(f'命中停止词 [{sw}]，重新监听')
-                continue
-
-            # ASR 纠错
-            if corrector:
-                corrected = corrector.correct(query)
-                if corrected != query:
-                    logger.info(f'ASR纠错: {query} -> {corrected}')
-                    query = corrected
-
-            # 模糊匹配优先（如果启用）
-            if fuzzy_matcher:
-                intent_name, slots = fuzzy_matcher.match(query)
-                if intent_name == 'open_app':
-                    # 防止模糊匹配把系统面板误识别为应用
-                    from src.executor import SYSTEM_PANEL_COMMANDS
-                    app_name = slots.get('app_name', '')
-                    if app_name in SYSTEM_PANEL_COMMANDS:
-                        intent_name = 'open_system_panel'
-                        slots = {'panel': app_name}
-                        logger.info(f' FuzzyRegex矫正: {query} => intent={intent_name}, slots={slots}')
-                    else:
-                        logger.info(f'FuzzyRegex解析: {query} => intent={intent_name}, slots={slots}')
-                elif intent_name != 'unknown':
-                    logger.info(f'FuzzyRegex解析: {query} => intent={intent_name}, slots={slots}')
-                else:
-                    intent_name, slots = parser.parse(query)
-                    logger.info(f'解析: {query} => intent={intent_name}, slots={slots}')
-            else:
-                intent_name, slots = parser.parse(query)
-                logger.info(f'解析: {query} => intent={intent_name}, slots={slots}')
-
-            plugin_ok, plugin_result = plugin_manager.try_execute(intent_name, slots)
-            if plugin_ok:
-                text = plugin_result
-                logger.info(f'插件命令执行: {text}')
-                say(text)
-                notify('语音助手', text)
-                continue
-
-            if intent_name == 'unknown':
-                # AI 生成：启动停止监听（语音说出停止词或按 Esc 键停止）
-                # 监听覆盖"生成 + 播报"整个阶段，实现播放中可打断（barge-in）
-                begin_output()
-                start_stop_listener(use_voice, recognizer, get_stop_words())
-                if BARGE_IN_ENABLED:
-                    start_barge_in_listener(recognizer)
-                result = execute_intent(intent_name, slots, query)
-                # 等 TTS 队列播报完再结束输出，确保播放期间停止词/开口打断始终有效
-                # 注意：wait_speaking_done 已在文件顶部导入为全局名，此处直接调用，
-                # 不可再写 `from src.feedback import wait_speaking_done`，否则会把它
-                # 变成当前函数的局部变量，导致函数前面（line 241/261）对它的调用
-                # 报 "cannot access local variable 'wait_speaking_done'"（未绑定局部变量）。
-                try:
-                    wait_speaking_done()
-                except Exception:
-                    pass
-                end_output()
-            else:
-                result = execute_intent(intent_name, slots, query)
-            # 兼容返回格式：(success, message) 或 (success, message, streamed)
-            if len(result) == 3:
-                success, message, streamed = result
-            else:
-                success, message = result
-                streamed = False
-            if not success:
-                logger.warning(message)
-                append_output('执行失败：' + message)
-                say('执行失败:' + message)
-            else:
-                logger.info(message)
-                append_output(message)
-                # 若 executor 已流式按句播报过，则不再整段念一遍，避免重复
-                if not streamed:
-                    say(message)
-            notify('语音助手', message)
-            set_status('● 监听中，说「你好黑猫」唤醒')
-
-        except KeyboardInterrupt:
-            say('已退出')
-            break
-        except Exception as e:
-            logger.error(f'运行时异常: {e}')
-            say('发生错误:' + str(e))
 
 if __name__ == '__main__':
     if '--debug' in sys.argv:
-        # 诊断模式：运行独立诊断工具并退出，不启动语音助手
-        try:
-            from src.debug_tool import run_diagnostics
-            run_diagnostics(cli=True)
-        except Exception as exc:
-            import traceback
-            traceback.print_exc()
-            print('[诊断] 运行失败:', exc)
-        sys.exit(0)
-    main()
+        from src.debug_tool import run_diagnostics
+        run_diagnostics(cli=True, write_file='--no-file' not in sys.argv)
+    else:
+        main()

@@ -6,7 +6,8 @@ import subprocess
 import threading
 import ctypes
 
-_tts_lock = threading.Lock()
+_tts_lock = threading.RLock()
+_worker_lock = threading.Lock()
 _speaking = threading.Event()
 
 # 引擎偏好配置（由 main.py 启动时通过 configure_tts 设置）
@@ -14,6 +15,7 @@ _speaking = threading.Event()
 # 只有用户显式选「azure」并在设置里填了订阅密钥时，才会启用 Azure（需信用卡注册）。
 _engine_pref = 'edge'
 _edge_voice = 'zh-CN-XiaoxiaoNeural'
+_character_profile = {}
 
 # Azure(微软)语音合成：国内走 azure.cn 节点、音质高、支持感情风格，可选引擎。
 # 需在 Azure 门户开通「语音服务」并拿到订阅密钥与区域(如 chinaeast2)，即需要信用卡注册；
@@ -51,18 +53,29 @@ _tts_worker = None
 # 引擎 -> 可重试的绝对时间戳（epoch）。失败后在 TTL 内跳过该引擎，
 # 离线时不再每条都卡网络超时去重试 edge-tts
 _tts_failed_engines = {}
+_tts_errors = {}
+_tts_fallback_notice = None
 _tts_cache_lock = threading.Lock()
 _tts_engine_ttl = 60  # 秒
 
 
 def configure_tts(engine='auto', voice='zh-CN-XiaoxiaoNeural',
                   style='calm', rate='-5%', pitch='+0Hz',
-                  azure_key=None, azure_region=None, azure_voice=None):
+                  azure_key=None, azure_region=None, azure_voice=None, character_profile=None):
     """设置 TTS 引擎偏好：auto / vits / edge / pyttsx3 / azure，
     以及在线神经语音(edge/azure)通用的感情风格/语速/音调。
     auto 默认本地 VITS 优先(零网络延迟)，无模型/失败时回落 edge。"""
     global _engine_pref, _edge_voice, _EDGE_STYLE, _EDGE_RATE, _EDGE_PITCH
     global _AZURE_KEY, _AZURE_REGION, _AZURE_VOICE
+    global _character_profile, _wake_audio
+    global _tts_fallback_notice
+    _tts_fallback_notice = None
+    _wake_audio = None
+    if character_profile is not None:
+        _character_profile = dict(character_profile)
+    with _tts_cache_lock:
+        _tts_failed_engines.clear()
+        _tts_errors.clear()
     if engine:
         _engine_pref = engine
     if voice:
@@ -86,9 +99,15 @@ _wake_audio = None  # 预生成的唤醒反馈音频 (samples, sample_rate)
 
 def warmup_tts():
     """后台预热本地 TTS 引擎，并预生成唤醒反馈音频，减少首次响应延迟"""
-    def _warm():
+    def _warm_impl():
         global _wake_audio
         try:
+            if _engine_pref == 'gptsovits':
+                from src.character_tts import synthesize
+                result = synthesize('我在。', _character_profile)
+                if result is not None:
+                    _wake_audio = result
+                return
             if _engine_pref in ('vits', 'auto'):
                 tts = _init_vits()
                 if tts is not None:
@@ -100,6 +119,9 @@ def warmup_tts():
                         print('[TTS] 唤醒反馈音频已预生成')
         except Exception:
             pass
+    def _warm():
+        with _tts_lock:
+            _warm_impl()
     try:
         threading.Thread(target=_warm, daemon=True, name='tts-warmup').start()
     except Exception:
@@ -107,22 +129,27 @@ def warmup_tts():
 
 
 def say_wake():
-    """快速播报唤醒反馈「我在」：优先用预生成音频，跳过合成延迟"""
-    import sounddevice as sd
-    if _wake_audio is not None:
+    with _tts_lock:
+        from src.stop import OUTPUT_DONE, STOP_REQUESTED
+        if OUTPUT_DONE.is_set():
+            # Stopping the previous answer must not silence the next wake.
+            STOP_REQUESTED.clear()
+        _speaking.set()
         try:
-            samples, rate = _wake_audio
-            sd.play(samples, rate, blocksize=8192)
-            sd.wait()
-            return True
-        except Exception as e:
-            print(f'[TTS] 快速唤醒播报失败: {e}')
-    return say_sync('我在')
+            if _wake_audio is not None:
+                import sounddevice as sd
+                samples, rate = _wake_audio
+                sd.play(samples, rate, blocksize=2048)
+                sd.wait()
+                return True
+            return say_sync('我在')
+        finally:
+            _speaking.clear()
 
 
 def _get_tmp_dir():
-    import tempfile
-    return tempfile.gettempdir()
+    from src.cleaner import _TEMP_DIR
+    return _TEMP_DIR
 
 
 # ---------- 播放辅助：Windows MCI（零依赖播放 mp3，play ... wait 同步等待） ----------
@@ -133,16 +160,24 @@ def _play_mp3(path):
     alias = 'assistant_tts'
     r = winmm.mciSendStringW(f'open "{path}" type mpegvideo alias {alias}', buf, 256, None)
     if r != 0:
-        raise RuntimeError(f'MCI open 失败: {buf.value}')
+        raise RuntimeError(f'MCI open 失败（错误码 {r}）')
     try:
-        winmm.mciSendStringW(f'play {alias}', None, 0, None)
+        if winmm.mciSendStringW(f'play {alias}', None, 0, None) != 0:
+            raise RuntimeError('音频播放器未能开始播放。')
+        length = ctypes.create_unicode_buffer(128)
+        winmm.mciSendStringW(f'status {alias} length', length, 128, None)
+        duration = int(length.value) / 1000 if length.value.isdigit() else 60
+        deadline = time.monotonic() + min(300, max(10, duration + 5))
         # 轮询播放状态，支持中途停止
         while True:
             time.sleep(0.1)
             status = ctypes.create_unicode_buffer(128)
-            winmm.mciSendStringW(f'status {alias} mode', status, 128, None)
+            if winmm.mciSendStringW(f'status {alias} mode', status, 128, None) != 0:
+                raise RuntimeError('无法读取音频播放状态。')
             if status.value == 'stopped':
                 break
+            if time.monotonic() > deadline:
+                raise TimeoutError('音频播放器没有按时结束。')
             from src.stop import is_stop_requested
             if is_stop_requested():
                 winmm.mciSendStringW(f'stop {alias}', None, 0, None)
@@ -172,38 +207,25 @@ def _speak_with_edge(text):
         if register_active_file:
             register_active_file(mp3_path)  # 标记正在使用，清理时跳过
         try:
-            # 重要：edge_tts 的 Communicate 会把传入文本 escape 后当作纯文本，
-            # 若传入 SSML 字符串，<speak ...> 标签会被逐字朗读（用户听到的
-            # "speak version 1.0 / synthesis" 正是这个 bug）。因此必须传纯文本，
-            # 并用 rate/pitch 参数控制语速与音调（edge_tts 不支持 express-as 风格）。
-            # edge_tts 7.x 的 pitch 仅接受带符号 Hz 格式(正则 ^[+-]\d+Hz$)，
-            # 不接受百分比；若配置仍是旧百分比写法(-6% / 0%)则兜底换算成 Hz，
-            # 避免整条引擎因格式错误直接失效（之前 "Invalid pitch '0%'" 就是这个原因）
-            pitch = _EDGE_PITCH
-            if isinstance(pitch, str) and pitch.endswith('%'):
-                try:
-                    pitch = f"{float(pitch.replace('%', '')):+.0f}Hz"
-                except Exception:
-                    pitch = '+0Hz'
-            communicate = edge_tts.Communicate(
-                text,
-                voice=_edge_voice,
-                rate=_EDGE_RATE,
-                pitch=pitch,
-                # 国内连微软境外节点经常慢/不稳：连线 4s、接收 12s 超时，
-                # 超时即快速失败回退到本地引擎，避免答案已显示却迟迟不读
-                connect_timeout=4,
-                receive_timeout=12,
-            )
-            asyncio.run(communicate.save(mp3_path))
+            from src.voice_health import edge_audio
+            from src.stop import is_stop_requested
+            data = asyncio.run(edge_audio(text, _edge_voice, _EDGE_RATE, _EDGE_PITCH, is_stop_requested))
+            if data is None:
+                return True
+            with open(mp3_path, 'wb') as stream:
+                stream.write(data)
+            from src.stop import is_stop_requested
+            if is_stop_requested():
+                return True
             _play_mp3(mp3_path)
             return True
         finally:
             if unregister_active_file:
                 unregister_active_file(mp3_path)
     except Exception as e:
-            print(f'[TTS] edge-tts 失败: {e}')
-            return False
+        from src.voice_health import error_message
+        _record_failure('edge', error_message(e))
+        return False
 
 
 # ---------- 引擎1.5：Azure(微软)语音合成（国内 azure.cn 节点，在线，音质高） ----------
@@ -239,56 +261,48 @@ def _azure_ssml(text):
             f'<voice name="{_AZURE_VOICE}">{inner}</voice></speak>')
 
 
-def _speak_with_azure(text):
-    """Azure 语音合成：POST {region}.tts.speech.azure.cn/cognitiveservices/v1，
-    Ocp-Apim-Subscription-Key 鉴权，SSML 请求体，直接返回 mp3。
-    需先在 Azure 门户开通「语音服务」并拿到订阅密钥与区域(如 chinaeast2)。"""
-    if not _AZURE_KEY or not _AZURE_REGION:
-        return False
+def azure_audio(text, key, region, voice, rate, pitch, style):
     import urllib.request
-    import urllib.error
-    try:
-        from src.cleaner import register_active_file, unregister_active_file
-    except ImportError:
-        register_active_file = unregister_active_file = None
-    ssml = _azure_ssml(text)
-    url = f'https://{_AZURE_REGION}.tts.speech.azure.cn/cognitiveservices/v1'
-    req = urllib.request.Request(url, data=ssml.encode('utf-8'), method='POST')
-    req.add_header('Ocp-Apim-Subscription-Key', _AZURE_KEY)
-    req.add_header('Content-Type', 'application/ssml+xml')
-    req.add_header('X-Microsoft-OutputFormat', 'audio-16khz-128kbitrate-mono-mp3')
-    req.add_header('User-Agent', 'KuronekoAssistant')
+    import xml.sax.saxutils as su
+    from src.voice_health import azure_endpoint
+    if not key.strip():
+        raise ValueError('Azure 订阅密钥未填写；免费微软在线语音与 Azure 订阅语音是两种方式。')
+    inner = f'<prosody rate="{_norm_pct(rate, "+0%")}" pitch="{_norm_pct(pitch, "+0Hz")}">{su.escape(text)}</prosody>'
+    if style and style != 'none':
+        inner = f'<mstts:express-as style="{su.escape(style)}">{inner}</mstts:express-as>'
+    body = ('<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" '
+            'xmlns:mstts="https://www.w3.org/2001/mstts" xml:lang="zh-CN">'
+            f'<voice name={su.quoteattr(voice)}>{inner}</voice></speak>')
+    req = urllib.request.Request(azure_endpoint(region), data=body.encode('utf-8'), method='POST', headers={
+        'Ocp-Apim-Subscription-Key': key, 'Content-Type': 'application/ssml+xml',
+        'X-Microsoft-OutputFormat': 'audio-16khz-128kbitrate-mono-mp3', 'User-Agent': 'KuronekoAssistant'})
+    with urllib.request.urlopen(req, timeout=10) as response:
+        data = response.read(20 * 1024 * 1024 + 1)
+        content_type = response.headers.get('Content-Type', '').lower()
+    if len(data) > 20 * 1024 * 1024 or not data or not content_type.startswith('audio/'):
+        raise RuntimeError('Azure 未返回有效音频，请检查密钥、区域及音色。')
+    return data
+
+
+def _speak_with_azure(text):
+    from src.cleaner import register_active_file, unregister_active_file
+    from src.voice_health import error_message
     mp3_path = os.path.join(_get_tmp_dir(), 'assistant_tts.mp3')
-    if register_active_file:
-        register_active_file(mp3_path)  # 标记正在使用，清理时跳过
+    register_active_file(mp3_path)
     try:
-        import ssl
-        ctx = ssl.create_default_context()
-        with urllib.request.urlopen(req, timeout=12, context=ctx) as resp:
-            audio = resp.read()
-        # 鉴权/参数错误时返回 XML/JSON 而非音频，首字节为 '<'
-        if not audio or audio[:1] == b'<':
-            print(f'[TTS] azure 返回非音频(可能密钥/区域错误): '
-                  f'{audio[:200].decode("utf-8", "ignore")}')
-            return False
-        with open(mp3_path, 'wb') as f:
-            f.write(audio)
+        audio = azure_audio(text, _AZURE_KEY, _AZURE_REGION, _AZURE_VOICE, _EDGE_RATE, _EDGE_PITCH, _EDGE_STYLE)
+        from src.stop import is_stop_requested
+        if is_stop_requested():
+            return True
+        with open(mp3_path, 'wb') as stream:
+            stream.write(audio)
         _play_mp3(mp3_path)
         return True
-    except urllib.error.HTTPError as e:
-        detail = ''
-        try:
-            detail = e.read().decode('utf-8', 'ignore')[:300]
-        except Exception:
-            pass
-        print(f'[TTS] azure HTTP 错误 {e.code}: {detail}')
-        return False
-    except Exception as e:
-        print(f'[TTS] azure 失败: {e}')
+    except Exception as exc:
+        _record_failure('azure', error_message(exc))
         return False
     finally:
-        if unregister_active_file:
-            unregister_active_file(mp3_path)
+        unregister_active_file(mp3_path)
 
 
 # ---------- 引擎2：本地 VITS（sherpa-onnx，离线自然语音） ----------
@@ -344,8 +358,15 @@ def _speak_with_vits(text):
         print(f'[TTS] VITS 播报开始，时长 {dur:.1f}s', flush=True)
         t0 = _time.time()
         # 加大 buffer，降低长音频流式播放时的 underrun 概率
-        sd.play(samples, audio.sample_rate, blocksize=8192)
-        sd.wait()
+        from src.stop import is_stop_requested
+        if is_stop_requested():
+            return True
+        sd.play(samples, audio.sample_rate, blocksize=2048)
+        while sd.get_stream().active:
+            if is_stop_requested():
+                sd.stop()
+                break
+            _time.sleep(0.03)
         print(f'[TTS] VITS 播报完成，实际耗时 {_time.time() - t0:.1f}s', flush=True)
         return True
     except Exception as e:
@@ -388,7 +409,21 @@ def _speak_with_pyttsx3(text):
         return False
     try:
         engine.say(text)
-        engine.runAndWait()
+        from src.stop import is_stop_requested
+        engine.startLoop(False)
+        try:
+            deadline = time.monotonic() + max(8, min(45, len(text) * 0.35 + 5))
+            while engine.isBusy():
+                engine.iterate()
+                if is_stop_requested():
+                    engine.stop()
+                    break
+                if time.monotonic() >= deadline:
+                    engine.stop()
+                    raise TimeoutError('Windows 语音引擎没有按时结束播报')
+                time.sleep(0.02)
+        finally:
+            engine.endLoop()
         return True
     except Exception as e:
         print(f'[TTS] pyttsx3 播报失败: {e}')
@@ -403,15 +438,25 @@ def _speak_with_sapi(text):
         ps_script = (
             "Add-Type -AssemblyName System.Speech; "
             "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
-            "$s.Speak($args[0]); "
+            "$s.Speak($env:KURONEKO_SPEECH_TEXT)"
         )
-        creationflags = 0x08000000  # CREATE_NO_WINDOW
-        subprocess.run(
-            ['powershell', '-NoProfile', '-NonInteractive', '-Command', ps_script, text],
-            check=True,
-            creationflags=creationflags,
-            capture_output=True,
+        environment = os.environ.copy()
+        environment['KURONEKO_SPEECH_TEXT'] = text
+        process = subprocess.Popen(
+            ['powershell', '-NoProfile', '-NonInteractive', '-Command', ps_script],
+            env=environment, creationflags=0x08000000,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
+        from src.stop import is_stop_requested
+        deadline = time.monotonic() + 120
+        while process.poll() is None:
+            if is_stop_requested() or time.monotonic() > deadline:
+                process.terminate()
+                process.wait(timeout=3)
+                return True
+            time.sleep(0.05)
+        if process.returncode:
+            return False
         return True
     except Exception as e:
         print(f'[TTS] SAPI 播报失败: {e}')
@@ -419,25 +464,64 @@ def _speak_with_sapi(text):
 
 
 # ---------- 主入口 ----------
+def _speak_with_character(text):
+    from src.character_tts import synthesize
+    from src.stop import is_stop_requested
+    try:
+        result = synthesize(text, _character_profile, is_stop_requested)
+        if result is None or is_stop_requested():
+            return True
+        import sounddevice as sd
+        samples, rate = result
+        sd.play(samples, rate, blocksize=2048)
+        while sd.get_stream().active:
+            if is_stop_requested():
+                sd.stop()
+                break
+            time.sleep(0.03)
+        return True
+    except Exception as exc:
+        from src.voice_health import error_message
+        _record_failure('gptsovits', error_message(exc))
+        return False
+
+
+def _record_failure(engine, message):
+    with _tts_cache_lock:
+        first = engine not in _tts_errors
+        _tts_errors[engine] = message
+    print(f'[TTS] {engine}: {message}')
+    if first:
+        from src.gui import append_system
+        fallback = '将尝试本地自然语音。' if engine in ('edge', 'azure') else '文字回答仍可使用。'
+        append_system(f'{message} {fallback}')
+
+
 def _current_order():
     """根据当前引擎偏好返回回退顺序"""
+    if _engine_pref == 'gptsovits':
+        return ['gptsovits']
     if _engine_pref == 'azure':
-        return ['azure', 'edge', 'pyttsx3', 'sapi', 'vits']
+        return ['azure', 'vits', 'pyttsx3', 'sapi']
     if _engine_pref == 'edge':
-        return ['edge', 'pyttsx3', 'sapi', 'vits']
+        return ['edge', 'vits', 'pyttsx3', 'sapi']
     if _engine_pref == 'vits':
-        return ['vits', 'edge', 'pyttsx3', 'sapi']
+        return ['vits', 'pyttsx3', 'sapi', 'edge']
     if _engine_pref == 'pyttsx3':
         return ['pyttsx3', 'sapi']
     # auto：本地 VITS(已打包进 exe，零网络延迟、离线可用)优先；
     # 若 VITS 模型缺失/初始化失败，则回落 edge(微软免费在线神经语音，无需注册/信用卡)；
     # 断网或 edge 失败再回退本地机械音/气泡音兜底
-    return ['vits', 'edge', 'azure', 'pyttsx3', 'sapi']
+    return ['vits', 'pyttsx3', 'sapi', 'edge']
 
 
 def _speak_cached(text):
     """带引擎可用性缓存的播报：失败的引擎在 TTL 内跳过，离线时不再每条都卡网络超时重试。"""
+    global _tts_fallback_notice
     for engine in _current_order():
+        from src.stop import is_stop_requested
+        if is_stop_requested():
+            return
         now = time.time()
         with _tts_cache_lock:
             banned = _tts_failed_engines.get(engine)
@@ -445,7 +529,9 @@ def _speak_cached(text):
                 continue
         ok = False
         try:
-            if engine == 'azure':
+            if engine == 'gptsovits':
+                ok = _speak_with_character(text)
+            elif engine == 'azure':
                 ok = _speak_with_azure(text)
             elif engine == 'edge':
                 ok = _speak_with_edge(text)
@@ -462,31 +548,46 @@ def _speak_cached(text):
             with _tts_cache_lock:
                 _tts_failed_engines.pop(engine, None)
             print(f'[TTS] 已使用 {engine} 引擎播报')
-            return
+            if engine != _current_order()[0] and _tts_fallback_notice != (_engine_pref, engine):
+                _tts_fallback_notice = (_engine_pref, engine)
+                from src.gui import append_system
+                names = {'vits': '本地自然语音', 'pyttsx3': 'Windows 系统声音', 'sapi': 'Windows 系统声音', 'edge': '微软在线语音'}
+                append_system(f'当前已回退到{names.get(engine, engine)}。可在设置中检测或试听所选声音。')
+            return True
+        with _tts_cache_lock:
+            known_error = engine in _tts_errors
+        if not known_error:
+            _record_failure(engine, f'{engine} 语音合成或播放失败。')
         with _tts_cache_lock:
             _tts_failed_engines[engine] = time.time() + _tts_engine_ttl
     print('[TTS] 所有语音引擎均失败，仅保留文字输出')
+    return False
 
 
 def _tts_worker_loop():
-    """后台 TTS 工作线程：从队列顺序取文本播报，避免每条都新建线程。"""
+    try:
+        import pythoncom
+        pythoncom.CoInitialize()
+    except ImportError:
+        pass
     while True:
         item = _tts_queue.get()
-        if item is None:
+        try:
+            if item is None:
+                return
+            from src.stop import is_stop_requested
+            with _tts_lock:
+                if is_stop_requested():
+                    continue
+                _speaking.set()
+                try:
+                    _speak_cached(item)
+                except Exception as exc:
+                    print(f'[TTS] 播报失败: {exc}')
+                finally:
+                    _speaking.clear()
+        finally:
             _tts_queue.task_done()
-            break
-        # 已在请求停止（如用户说了停止词）：跳过本条待播报，快速静音
-        from src.stop import is_stop_requested
-        if is_stop_requested():
-            _tts_queue.task_done()
-            continue
-        with _tts_lock:
-            _speaking.set()
-            try:
-                _speak_cached(item)
-            finally:
-                _speaking.clear()
-        _tts_queue.task_done()
 
 
 def clear_speaking():
@@ -505,25 +606,23 @@ def clear_speaking():
 
 def _ensure_tts_worker():
     global _tts_worker
-    if _tts_worker is None or not _tts_worker.is_alive():
-        _tts_worker = threading.Thread(target=_tts_worker_loop, daemon=True, name='tts-worker')
-        _tts_worker.start()
+    with _worker_lock:
+        if _tts_worker is None or not _tts_worker.is_alive():
+            _tts_worker = threading.Thread(target=_tts_worker_loop, daemon=True, name='tts-worker')
+            _tts_worker.start()
 
 
 def is_speaking():
-    """当前是否正在语音播报"""
-    return _speaking.is_set()
+    return _speaking.is_set() or _tts_queue.unfinished_tasks > 0
 
 
 def wait_speaking_done(timeout=None):
-    """等待语音播报结束（主循环在监听前调用，避免录入助手自己的回声）"""
-    if timeout is None:
-        while _speaking.is_set():
-            time.sleep(0.05)
-    else:
-        end = time.time() + timeout
-        while _speaking.is_set() and time.time() < end:
-            time.sleep(0.05)
+    from src.lifecycle import shutdown
+    deadline = None if timeout is None else time.monotonic() + timeout
+    while is_speaking() and not shutdown.is_set():
+        if deadline is not None and time.monotonic() >= deadline:
+            break
+        shutdown.wait(0.03)
 
 
 def say_sync(text):
@@ -536,10 +635,9 @@ def say_sync(text):
     with _tts_lock:
         _speaking.set()
         try:
-            _speak_cached(text)
+            return _speak_cached(text)
         finally:
             _speaking.clear()
-    return True
 
 
 def say(text):
@@ -549,8 +647,9 @@ def say(text):
     if not text:
         return True
 
-    # 先标记"正在播报"，让主循环在真正开播前就停止监听（防回声）
-    _speaking.set()
+    from src.stop import is_stop_requested
+    if is_stop_requested():
+        return True
     _ensure_tts_worker()
     try:
         _tts_queue.put(text)
@@ -565,7 +664,7 @@ def notify(title, message):
     try:
         from win10toast import ToastNotifier
         toaster = ToastNotifier()
-        toaster.show_toast(title, message, duration=5)
+        toaster.show_toast(title, str(message)[:220], duration=3, threaded=True)
         return True
     except ImportError:
         pass

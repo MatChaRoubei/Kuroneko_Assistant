@@ -1,0 +1,155 @@
+[
+  {
+    "phrase": "你好黑猫现在几点",
+    "recognized": "你好黑猫现在几点",
+    "expected": "get_time",
+    "actual": "get_time",
+    "slots": {},
+    "passed": true,
+    "required": true,
+    "endpoint_ms": 472,
+    "asr_seconds": 0.052,
+    "vad_cpu_seconds": 0.008
+  },
+  {
+    "phrase": "你好黑猫五分钟后提醒我喝水",
+    "recognized": "你好黑猫五分钟后提醒我喝水",
+    "expected": "set_timer",
+    "actual": "set_timer",
+    "slots": {
+      "seconds": 300,
+      "content": "喝水"
+    },
+    "passed": true,
+    "required": true,
+    "endpoint_ms": 448,
+    "asr_seconds": 0.082,
+    "vad_cpu_seconds": 0.012
+  },
+  {
+    "phrase": "你好黑猫音量调到百分之五十",
+    "recognized": "你好黑猫音量调到百分之五十",
+    "expected": "set_volume",
+    "actual": "set_volume",
+    "slots": {
+      "value": 50
+    },
+    "passed": true,
+    "required": true,
+    "endpoint_ms": 481,
+    "asr_seconds": 0.069,
+    "vad_cpu_seconds": 0.008
+  },
+  {
+    "phrase": "你好黑猫搜索一下三体",
+    "recognized": "你好黑猫搜索一下身体",
+    "expected": "web_search",
+    "actual": "web_search",
+    "slots": {
+      "query": "身体"
+    },
+    "passed": true,
+    "required": true,
+    "endpoint_ms": 478,
+    "asr_seconds": 0.063,
+    "vad_cpu_seconds": 0.009
+  },
+  {
+    "phrase": "你好黑猫不要关机",
+    "recognized": "你好黑猫不要关机",
+    "expected": "unknown",
+    "actual": "unknown",
+    "slots": {},
+    "passed": true,
+    "required": true,
+    "endpoint_ms": 494,
+    "asr_seconds": 0.054,
+    "vad_cpu_seconds": 0.008
+  },
+  {
+    "phrase": "你好黑猫下一首",
+    "recognized": "你好黑猫下一首",
+    "expected": "media_control",
+    "actual": "media_control",
+    "slots": {
+      "action": "next_track"
+    },
+    "passed": true,
+    "required": true,
+    "endpoint_ms": 471,
+    "asr_seconds": 0.044,
+    "vad_cpu_seconds": 0.007
+  },
+  {
+    "phrase": "黑猫现在几点",
+    "recognized": "你猫现在几点",
+    "expected": "get_time",
+    "actual": "wake_missed",
+    "slots": {},
+    "passed": false,
+    "required": false,
+    "endpoint_ms": 460,
+    "asr_seconds": 0.045,
+    "vad_cpu_seconds": 0.007
+  },
+  {
+    "phrase": "黑猫五分钟后提醒我喝水",
+    "recognized": "你们五分钟后提醒我喝水",
+    "expected": "set_timer",
+    "actual": "wake_missed",
+    "slots": {},
+    "passed": false,
+    "required": false,
+    "endpoint_ms": 478,
+    "asr_seconds": 0.061,
+    "vad_cpu_seconds": 0.011
+  },
+  {
+    "phrase": "黑猫音量调到百分之五十",
+    "recognized": "屏幕音量调到百分之五十",
+    "expected": "set_volume",
+    "actual": "wake_missed",
+    "slots": {},
+    "passed": false,
+    "required": false,
+    "endpoint_ms": 455,
+    "asr_seconds": 0.056,
+    "vad_cpu_seconds": 0.011
+  },
+  {
+    "phrase": "黑猫搜索一下三体",
+    "recognized": "你猫搜索一下三体",
+    "expected": "web_search",
+    "actual": "wake_missed",
+    "slots": {},
+    "passed": false,
+    "required": false,
+    "endpoint_ms": 491,
+    "asr_seconds": 0.048,
+    "vad_cpu_seconds": 0.008
+  },
+  {
+    "phrase": "黑猫不要关机",
+    "recognized": "你猫不要关机",
+    "expected": "unknown",
+    "actual": "wake_missed",
+    "slots": {},
+    "passed": false,
+    "required": false,
+    "endpoint_ms": 461,
+    "asr_seconds": 0.045,
+    "vad_cpu_seconds": 0.007
+  },
+  {
+    "phrase": "黑猫下一首",
+    "recognized": "你摸下一首",
+    "expected": "media_control",
+    "actual": "wake_missed",
+    "slots": {},
+    "passed": false,
+    "required": false,
+    "endpoint_ms": 456,
+    "asr_seconds": 0.043,
+    "vad_cpu_seconds": 0.006
+  }
+]
